@@ -20,6 +20,15 @@ export interface DataState {
   totalRows: number
 }
 
+/**
+ * 对话消息类型
+ */
+export interface Message {
+  role: 'user' | 'assistant' | 'system'
+  content: string
+  confidence?: number
+}
+
 export interface QAState {
   question: string
   isLoading: boolean
@@ -27,6 +36,7 @@ export interface QAState {
   answer: QAResponse | null
   model: string
   data: DataState | null
+  messages: Message[] // 添加消息历史数组
 }
 
 export type LLMModel = 

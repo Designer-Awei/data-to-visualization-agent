@@ -4,10 +4,10 @@
  */
 'use client'
 
-import React, { useState } from 'react'
-import { Input, Button, Card, Spin, Alert, Typography, Select, Upload } from 'antd'
-import { SendOutlined, InboxOutlined } from '@ant-design/icons'
-import { QAState, QAResponse, DataState } from '@/types/qa'
+import React, { useState, useRef, useEffect } from 'react'
+import { Input, Button, Card, Spin, Alert, Typography, Select, Upload, Avatar } from 'antd'
+import { SendOutlined, InboxOutlined, UserOutlined, RobotOutlined } from '@ant-design/icons'
+import { QAState, QAResponse, DataState, Message } from '@/types/qa'
 import type { UploadProps } from 'antd'
 import { message } from 'antd'
 import ReactMarkdown from 'react-markdown'
@@ -23,9 +23,21 @@ export const QA: React.FC = () => {
     isLoading: false,
     error: null,
     answer: null,
-    model: 'THUDM/GLM-4-9B-0414', // 默认模型
-    data: null
+    model: 'THUDM/GLM-4-9B-0414',
+    data: null,
+    messages: [] // 新增：存储对话历史
   })
+
+  const messagesEndRef = useRef<HTMLDivElement>(null)
+
+  // 新增：自动滚动到最新消息
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
+  }
+
+  useEffect(() => {
+    scrollToBottom()
+  }, [state.messages])
 
   /**
    * 处理问题输入变化
@@ -66,7 +78,11 @@ export const QA: React.FC = () => {
           ...prev,
           isLoading: false,
           data: responseData,
-          error: null
+          error: null,
+          messages: [...prev.messages, {
+            role: 'system',
+            content: `已成功上传数据文件：${info.file.name}，共 ${responseData.totalRows} 条数据。`
+          }]
         }))
         message.success(`${info.file.name} 文件解析成功`)
       } else if (status === 'error') {
@@ -92,10 +108,17 @@ export const QA: React.FC = () => {
       return
     }
 
+    // 添加用户问题到消息列表
+    const userMessage: Message = {
+      role: 'user',
+      content: state.question
+    }
+
     setState(prev => ({
       ...prev,
       isLoading: true,
-      error: null
+      error: null,
+      messages: [...prev.messages, userMessage]
     }))
 
     try {
@@ -107,7 +130,8 @@ export const QA: React.FC = () => {
         body: JSON.stringify({
           question: state.question,
           model: state.model,
-          data: state.data?.rows // 将解析后的数据传递给问答API
+          data: state.data?.rows,
+          messages: state.messages // 发送历史消息到后端
         }),
       })
 
@@ -117,10 +141,20 @@ export const QA: React.FC = () => {
       }
 
       const data: QAResponse = await response.json()
+      
+      // 添加AI回答到消息列表
+      const aiMessage: Message = {
+        role: 'assistant',
+        content: data.answer,
+        confidence: data.confidence
+      }
+
       setState(prev => ({
         ...prev,
         answer: data,
-        isLoading: false
+        isLoading: false,
+        question: '', // 清空输入框
+        messages: [...prev.messages, aiMessage]
       }))
     } catch (error: any) {
       setState(prev => ({
@@ -128,6 +162,14 @@ export const QA: React.FC = () => {
         error: error.message || '发生错误，请稍后重试',
         isLoading: false
       }))
+    }
+  }
+
+  // 新增：处理按回车发送
+  const handleKeyPress = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      handleSubmit()
     }
   }
 
@@ -157,7 +199,7 @@ export const QA: React.FC = () => {
               <table className="min-w-full divide-y divide-gray-200">
                 <thead className="bg-gray-50">
                   <tr>
-                    {state.data.columns.map((column: string) => (
+                    {state.data!.columns.map((column: string) => (
                       <th
                         key={column}
                         className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
@@ -216,46 +258,53 @@ export const QA: React.FC = () => {
             />
           </div>
 
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              输入问题
-            </label>
+          {/* 对话历史区域 */}
+          <div className="bg-gray-50 rounded-lg p-4 h-96 overflow-y-auto">
+            {state.messages.map((msg, index) => (
+              <div key={index} className={`flex items-start space-x-3 mb-4 ${msg.role === 'user' ? 'justify-end' : ''}`}>
+                {msg.role !== 'user' && (
+                  <Avatar icon={msg.role === 'system' ? <InboxOutlined /> : <RobotOutlined />} 
+                         className={msg.role === 'system' ? 'bg-blue-500' : 'bg-green-500'} />
+                )}
+                <div className={`max-w-[70%] ${msg.role === 'user' ? 'bg-blue-500 text-white' : 'bg-white'} p-3 rounded-lg shadow`}>
+                  <ReactMarkdown>{msg.content}</ReactMarkdown>
+                  {msg.role === 'assistant' && msg.confidence && (
+                    <div className="mt-1 text-xs text-gray-500">
+                      置信度：{Math.round(msg.confidence * 100)}%
+                    </div>
+                  )}
+                </div>
+                {msg.role === 'user' && (
+                  <Avatar icon={<UserOutlined />} className="bg-blue-500" />
+                )}
+              </div>
+            ))}
+            <div ref={messagesEndRef} />
+          </div>
+
+          <div className="flex space-x-2">
             <TextArea
               value={state.question}
               onChange={handleQuestionChange}
+              onKeyPress={handleKeyPress}
               placeholder="请输入您的问题..."
-              autoSize={{ minRows: 3, maxRows: 6 }}
+              autoSize={{ minRows: 1, maxRows: 3 }}
+              className="flex-1"
             />
+            <Button
+              type="primary"
+              onClick={handleSubmit}
+              loading={state.isLoading}
+              disabled={!state.question.trim() || !state.data}
+              icon={<SendOutlined />}
+              className="flex-shrink-0"
+            >
+              发送
+            </Button>
           </div>
-
-          <Button
-            type="primary"
-            onClick={handleSubmit}
-            loading={state.isLoading}
-            disabled={!state.question.trim() || !state.data}
-            className="w-full"
-          >
-            提交问题
-          </Button>
 
           {state.error && (
             <div className="text-red-500 text-sm">{state.error}</div>
-          )}
-
-          {state.answer && (
-            <div className="mt-4 space-y-2">
-              <Title level={4}>回答：</Title>
-              <div className="p-4 bg-gray-50 rounded-lg">
-                <Paragraph>
-                  <ReactMarkdown>{state.answer.answer}</ReactMarkdown>
-                </Paragraph>
-                {state.answer.confidence && (
-                  <div className="mt-2 text-sm text-gray-500">
-                    置信度：{Math.round(state.answer.confidence * 100)}%
-                  </div>
-                )}
-              </div>
-            </div>
           )}
         </div>
       </div>

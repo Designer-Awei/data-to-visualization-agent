@@ -1,127 +1,81 @@
 /**
  * 问答API路由处理程序
+ * @module api/qa/route
+ * @description 接收用户问题和数据，调用SiliconFlow LLM进行智能问答，支持数据驱动的分析。
  */
 import { NextResponse } from 'next/server'
-import { OpenAI } from 'openai'
+import OpenAI from 'openai'
+import { Message } from '@/types/qa'
 
-// 初始化OpenAI客户端
+// 初始化OpenAI客户端，使用SiliconFlow配置
 const client = new OpenAI({
   apiKey: process.env.SILICONFLOW_API_KEY,
   baseURL: 'https://api.siliconflow.cn/v1'
 })
 
-export async function POST(request: Request) {
+/**
+ * 处理POST请求，进行智能问答
+ * @param {Request} req - 请求对象，包含question、model、data、messages等
+ * @returns {Promise<NextResponse>} - 返回LLM的回答
+ */
+export async function POST(req: Request) {
   try {
-    const { question, model = 'THUDM/GLM-4-9B-0414', data } = await request.json()
+    const { question, model = process.env.DEFAULT_MODEL, data, messages = [] } = await req.json()
 
-    if (!question) {
+    if (!question?.trim()) {
       return NextResponse.json(
-        { error: '问题不能为空' },
+        { error: '请输入问题' },
         { status: 400 }
       )
     }
 
-    if (!data || !Array.isArray(data) || data.length === 0) {
-      return NextResponse.json(
-        { error: '请先上传数据' },
-        { status: 400 }
-      )
+    // 构建系统提示词，若有数据则附加数据内容
+    let systemPrompt = ''
+    if (data && Array.isArray(data) && data.length > 0) {
+      // 只展示前10条数据，防止prompt过长
+      const previewRows = data.slice(0, 10)
+      const dataPreview = JSON.stringify(previewRows, null, 2)
+      systemPrompt = `你是一个数据分析助手。我会给你一些数据和问题，请帮我分析数据并回答问题。\n当前数据集包含 ${data.length} 条记录，数据示例：\n${dataPreview}\n请基于这些数据来回答问题。如果问题无法从数据中得到答案，请明确告知。回答要客观、准确，并尽可能给出数据支持。`
+    } else {
+      systemPrompt = '你是一个智能助手，请帮我回答问题。'
     }
 
-    // 构建数据摘要
-    const dataSummary = {
-      totalRows: data.length,
-      columns: Object.keys(data[0]),
-      sampleData: data.slice(0, 5), // 前5条数据作为样本
-      dataStats: {}
-    }
-
-    // 计算每列的基本统计信息
-    for (const column of dataSummary.columns) {
-      const values = data.map(row => row[column])
-      const numericValues = values.filter(v => !isNaN(Number(v)))
-      
-      dataSummary.dataStats[column] = {
-        type: numericValues.length === values.length ? 'numeric' : 'categorical',
-        uniqueValues: new Set(values).size,
-        hasNulls: values.some(v => v === null || v === undefined || v === ''),
-        ...(numericValues.length > 0 && {
-          min: Math.min(...numericValues),
-          max: Math.max(...numericValues),
-          avg: numericValues.reduce((a, b) => a + Number(b), 0) / numericValues.length
-        })
-      }
-    }
-
-    // 构建系统提示词
-    const systemPrompt = `你是一个专业的数据分析助手。我会给你一些数据和问题，请你帮我分析数据并回答问题。
-
-数据概述：
-- 总行数：${dataSummary.totalRows}
-- 列名：${dataSummary.columns.join(', ')}
-
-数据统计信息：
-${Object.entries(dataSummary.dataStats)
-  .map(([col, stats]) => `${col}: 
-  - 类型: ${stats.type}
-  - 唯一值数量: ${stats.uniqueValues}
-  - 是否包含空值: ${stats.hasNulls}
-  ${stats.type === 'numeric' ? `- 最小值: ${stats.min}\n  - 最大值: ${stats.max}\n  - 平均值: ${stats.avg.toFixed(2)}` : ''}`)
-  .join('\n')}
-
-样本数据：
-${JSON.stringify(dataSummary.sampleData, null, 2)}
-
-完整数据集：
-${JSON.stringify(data)}
-
-要求：
-1. 基于提供的数据进行分析和回答
-2. 如果需要可视化，请说明使用什么类型的图表更合适
-3. 回答要客观专业，给出具体的数据支持
-4. 如果数据不足以回答问题，请明确指出
-5. 使用中文回答`
+    // 构建对话历史
+    const conversationMessages = [
+      { role: 'system', content: systemPrompt },
+      ...messages.slice(-5), // 保留最近5条消息作为上下文
+      { role: 'user', content: question }
+    ]
 
     try {
+      // 调用模型API
       const completion = await client.chat.completions.create({
-        model: model,
-        messages: [
-          {
-            role: 'system',
-            content: systemPrompt
-          },
-          {
-            role: 'user',
-            content: question
-          }
-        ],
+        model,
+        messages: conversationMessages,
         temperature: 0.7,
+        max_tokens: 4096,
         top_p: 0.9,
-        top_k: 50,
         frequency_penalty: 0.5,
-        stream: false,
-        max_tokens: 4096
+        presence_penalty: 0.5,
+        stream: false
       })
 
-      const answer = completion.choices[0]?.message?.content || ''
-      
-      // 计算置信度（基于回答的完整性和数据支持）
+      const answer = completion.choices[0]?.message?.content || '抱歉，我无法回答这个问题。'
+      // 计算置信度（基于回答长度和完整性）
       const confidence = Math.min(
         0.95,
-        Math.max(0.6, answer.length / 1000)
+        Math.max(0.5, answer.length / 1000)
       )
 
       return NextResponse.json({
         answer,
         confidence,
-        relatedData: dataSummary.sampleData // 返回样本数据作为相关数据
+        relatedData: [] // TODO: 实现相关数据检索
       })
-
     } catch (error: any) {
       // 处理常见错误码
       const statusCode = error.response?.status || 500
       let errorMessage = '服务器内部错误'
-
       switch (statusCode) {
         case 400:
           errorMessage = '请求参数错误，请检查输入'
@@ -140,7 +94,6 @@ ${JSON.stringify(data)}
           errorMessage = '模型服务暂时不可用，请稍后再试'
           break
       }
-
       console.error('LLM API错误:', error)
       return NextResponse.json(
         { 
@@ -150,8 +103,7 @@ ${JSON.stringify(data)}
         { status: statusCode }
       )
     }
-
-  } catch (error) {
+  } catch (error: any) {
     console.error('请求处理错误:', error)
     return NextResponse.json(
       { error: '处理请求时发生错误' },
