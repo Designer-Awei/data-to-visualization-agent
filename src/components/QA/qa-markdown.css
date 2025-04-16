@@ -1,0 +1,70 @@
+/* qa-markdown.css - 聊天Markdown内容美化与溢出修复 */
+.markdown-body {
+  word-break: break-all;
+  white-space: pre-wrap;
+  overflow-x: auto;
+  max-width: 100%;
+  font-size: 1rem;
+}
+
+.markdown-body code, .markdown-body pre {
+  word-break: break-all;
+  white-space: pre;
+  max-width: 100%;
+  font-size: 1rem;
+}
+
+.markdown-body code, .markdown-body pre {
+  word-break: break-all;
+  background: #f6f8fa;
+  border-radius: 4px;
+  padding: 2px 4px;
+  font-size: 95%;
+}
+
+.markdown-body pre {
+  padding: 12px;
+  margin: 8px 0;
+  white-space: pre;
+  overflow-x: auto;
+  overflow-y: auto;
+  max-height: calc(1.6em * 8 + 24px); /* 8行+padding */
+  background: #f6f8fa;
+  border-radius: 4px;
+  font-size: 95%;
+}
+
+.markdown-body table {
+  display: block;
+  width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin: 8px 0;
+}
+
+.markdown-body th, .markdown-body td {
+  border: 1px solid #e5e7eb;
+  padding: 4px 8px;
+  text-align: left;
+}
+
+.markdown-body ul, .markdown-body ol {
+  margin-left: 1.5em;
+}
+
+.markdown-body blockquote {
+  border-left: 4px solid #d1d5db;
+  margin: 8px 0;
+  padding-left: 1em;
+  color: #6b7280;
+  background: #f9fafb;
+}
+
+.markdown-body code {
+  word-break: break-all;
+  white-space: pre;
+  background: #f6f8fa;
+  border-radius: 4px;
+  padding: 2px 4px;
+  font-size: 95%;
+} 

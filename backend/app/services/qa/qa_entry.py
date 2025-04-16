@@ -34,7 +34,14 @@ def main():
         response = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "你是数据分析专家，用Markdown输出结果"},
+                {
+                    "role": "system",
+                    "content": (
+                        "你是一个专业的AI助手。遇到用户要求"用markdown格式输出"、"请给我markdown源码"、"请输出json格式"、"请输出代码"等类似需求时,"
+                        "请务必将相关内容包裹在对应的代码块中（如用三个反引号markdown、json、python等开头和结尾），正文和代码块分开输出。"
+                        "其他普通回答正常输出。"
+                    )
+                },
                 {"role": "user", "content": prompt}
             ],
             temperature=0.7,
@@ -43,6 +50,7 @@ def main():
             frequency_penalty=0.5
         )
         answer = response.choices[0].message.content
+        answer = nan_to_none(answer)
         print(json.dumps({'answer': answer}, ensure_ascii=False))
     except Exception as e:
         print(json.dumps({'error': str(e)}))

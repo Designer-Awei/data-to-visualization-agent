@@ -7,6 +7,16 @@ import numpy as np
 from typing import Dict, Any
 
 
+def safe_mode(col_data):
+    try:
+        mode_val = col_data.mode().iloc[0] if not col_data.mode().empty else None
+        if pd.isna(mode_val):
+            return None
+        return mode_val
+    except Exception:
+        return None
+
+
 def generate_summary(df: pd.DataFrame, sample_size: int = 10) -> Dict[str, Any]:
     """
     生成数据摘要，包括字段统计、分布、极值、缺失值、样本行等。
@@ -14,6 +24,7 @@ def generate_summary(df: pd.DataFrame, sample_size: int = 10) -> Dict[str, Any]:
     :param sample_size: 样本行数量，默认10
     :return: 摘要信息字典
     """
+    df = df.where(pd.notnull(df), None)  # 替换NaN为None
     summary = {
         'columns': [],
         'row_count': len(df),
@@ -31,7 +42,7 @@ def generate_summary(df: pd.DataFrame, sample_size: int = 10) -> Dict[str, Any]:
             'max': col_data.max() if np.issubdtype(col_data.dtype, np.number) else None,
             'mean': col_data.mean() if np.issubdtype(col_data.dtype, np.number) else None,
             'std': col_data.std() if np.issubdtype(col_data.dtype, np.number) else None,
-            'top': col_data.mode().iloc[0] if not col_data.mode().empty else None
+            'top': safe_mode(col_data)
         }
         summary['columns'].append(col_summary)
     return summary 

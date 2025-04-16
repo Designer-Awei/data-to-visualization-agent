@@ -11,11 +11,52 @@ import { QAState, QAResponse, DataState, Message } from '@/types/qa'
 import type { UploadProps } from 'antd'
 import { message } from 'antd'
 import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import './qa-markdown.css'
 
 const { TextArea } = Input
 const { Title, Text, Paragraph } = Typography
 const { Option } = Select
 const { Dragger } = Upload
+
+/**
+ * 分割Markdown内容为有序片段数组，保留正文和代码块原始顺序
+ * @param content LLM返回的完整内容
+ * @returns {Array<{type: 'text', content: string} | {type: 'code', lang: string, code: string}>}
+ */
+function splitMarkdownSegments(content: string): Array<{type: 'text', content: string} | {type: 'code', lang: string, code: string}> {
+  const codeBlockRegex = /```(\w*)\n([\s\S]*?)```/g;
+  let match;
+  let lastIndex = 0;
+  const segments: Array<{type: 'text', content: string} | {type: 'code', lang: string, code: string}> = [];
+  while ((match = codeBlockRegex.exec(content)) !== null) {
+    // 前面的正文片段
+    if (match.index > lastIndex) {
+      segments.push({ type: 'text', content: content.slice(lastIndex, match.index) });
+    }
+    // 代码块片段
+    segments.push({ type: 'code', lang: match[1], code: match[2] });
+    lastIndex = match.index + match[0].length;
+  }
+  // 剩余正文
+  if (lastIndex < content.length) {
+    segments.push({ type: 'text', content: content.slice(lastIndex) });
+  }
+  // 修复：正文片段结尾为列表项且下一个片段为代码块时，自动补空行
+  for (let i = 0; i < segments.length - 1; i++) {
+    const curr = segments[i];
+    const next = segments[i + 1];
+    if (
+      curr.type === 'text' &&
+      next.type === 'code' &&
+      /(^|\n)\s*(\d+\.|[-*+])\s+/.test(curr.content.trim().split('\n').slice(-1)[0]) &&
+      !curr.content.endsWith('\n')
+    ) {
+      curr.content += '\n';
+    }
+  }
+  return segments;
+}
 
 export const QA: React.FC = () => {
   const [state, setState] = useState<QAState>({
@@ -37,7 +78,17 @@ export const QA: React.FC = () => {
 
   useEffect(() => {
     scrollToBottom()
+    // 只在assistant新回复到来时输出一次原始内容
+    const lastMsg = state.messages[state.messages.length - 1]
+    if (lastMsg && lastMsg.role === 'assistant') {
+      // eslint-disable-next-line no-console
+      console.log('LLM原始返回内容:', lastMsg.content)
+    }
   }, [state.messages])
+
+  const [inputDisabled, setInputDisabled] = useState(false) // 是否禁用输入
+  const [abortController, setAbortController] = useState<AbortController | null>(null) // 控制fetch中断
+  const [isAborting, setIsAborting] = useState(false) // 是否正在打断
 
   /**
    * 处理问题输入变化
@@ -98,70 +149,71 @@ export const QA: React.FC = () => {
 
   /**
    * 提交问题到后端API
+   * 发送后立即清空输入框并禁用输入，等待回复或打断后恢复
+   * @returns {Promise<void>}
    */
   const handleSubmit = async () => {
-    if (!state.question.trim()) {
-      setState(prev => ({
-        ...prev,
-        error: '请输入问题'
-      }))
-      return
-    }
-
-    // 添加用户问题到消息列表
-    const userMessage: Message = {
-      role: 'user',
-      content: state.question
-    }
-
+    if (!state.question.trim() || state.isLoading) return
+    setInputDisabled(true)
+    setIsAborting(false)
     setState(prev => ({
       ...prev,
       isLoading: true,
       error: null,
-      messages: [...prev.messages, userMessage]
+      question: '',
+      messages: [...prev.messages, { role: 'user', content: prev.question }]
     }))
-
+    const controller = new AbortController()
+    setAbortController(controller)
     try {
       const response = await fetch('/api/qa', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           question: state.question,
           model: state.model,
           data: state.data?.rows,
-          messages: state.messages // 发送历史消息到后端
+          messages: state.messages
         }),
+        signal: controller.signal
       })
-
       if (!response.ok) {
         const errorData = await response.json()
         throw new Error(errorData.error || '请求失败')
       }
-
       const data: QAResponse = await response.json()
-      
-      // 添加AI回答到消息列表
       const aiMessage: Message = {
         role: 'assistant',
         content: data.answer,
         confidence: data.confidence
       }
-
       setState(prev => ({
         ...prev,
         answer: data,
         isLoading: false,
-        question: '', // 清空输入框
         messages: [...prev.messages, aiMessage]
       }))
+      setInputDisabled(false)
+      setAbortController(null)
     } catch (error: any) {
-      setState(prev => ({
-        ...prev,
-        error: error.message || '发生错误，请稍后重试',
-        isLoading: false
-      }))
+      if (error.name === 'AbortError') {
+        setState(prev => ({ ...prev, isLoading: false, error: '回复已被打断' }))
+      } else {
+        setState(prev => ({ ...prev, error: error.message || '发生错误，请稍后重试', isLoading: false }))
+      }
+      setInputDisabled(false)
+      setAbortController(null)
+      setIsAborting(false)
+    }
+  }
+
+  /**
+   * 打断回复
+   */
+  const handleAbort = () => {
+    if (abortController) {
+      setIsAborting(true)
+      abortController.abort()
     }
   }
 
@@ -260,29 +312,71 @@ export const QA: React.FC = () => {
 
           {/* 对话历史区域 */}
           <div className="bg-gray-50 rounded-lg p-4 h-96 overflow-y-auto">
-            {state.messages.map((msg, index) => (
-              <div key={index} className={`flex items-start space-x-3 mb-4 ${msg.role === 'user' ? 'justify-end' : ''}`}>
-                {msg.role !== 'user' && (
-                  <Avatar icon={msg.role === 'system' ? <InboxOutlined /> : <RobotOutlined />} 
-                         className={msg.role === 'system' ? 'bg-blue-500' : 'bg-green-500'} />
-                )}
-                <div className={`max-w-[70%] ${msg.role === 'user' ? 'bg-blue-500 text-white' : 'bg-white'} p-3 rounded-lg shadow`}>
-                  <ReactMarkdown>{msg.content}</ReactMarkdown>
-                  {msg.role === 'assistant' && msg.confidence && (
-                    <div className="mt-1 text-xs text-gray-500">
-                      置信度：{Math.round(msg.confidence * 100)}%
+            {state.messages.map((msg, index) => {
+              if (msg.role === 'assistant') {
+                const segments = splitMarkdownSegments(msg.content);
+                return (
+                  <div key={index} className={`flex items-start space-x-3 mb-4`}>
+                    <Avatar icon={<RobotOutlined />} className="bg-green-500" />
+                    <div className="max-w-[70%] bg-white p-3 rounded-lg shadow">
+                      {/* 按顺序渲染正文和代码块 */}
+                      {segments.map((seg, i) =>
+                        seg.type === 'text' ? (
+                          seg.content.trim() ? (
+                            <div className="markdown-body mb-2" key={i}>
+                              <ReactMarkdown remarkPlugins={[remarkGfm]}>{seg.content.replace(/\n{3,}/g, '\n\n')}</ReactMarkdown>
+                            </div>
+                          ) : null
+                        ) : (
+                          <div className="qa-code-block-container mb-2" key={i} style={{position: 'relative', background: '#f6f8fa', borderRadius: 6, border: '1px solid #eaeaea', overflow: 'auto'}}>
+                            <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '2px 8px', background: '#f3f3f3', borderTopLeftRadius: 6, borderTopRightRadius: 6, borderBottom: '1px solid #eaeaea'}}>
+                              <span style={{fontSize: 12, color: '#888'}}>{seg.lang || 'code'}</span>
+                              <button
+                                style={{fontSize: 12, color: '#007bff', background: 'none', border: 'none', cursor: 'pointer'}}
+                                onClick={() => {
+                                  navigator.clipboard.writeText(seg.code)
+                                  message.success('代码已复制')
+                                }}
+                              >复制</button>
+                            </div>
+                            <pre style={{margin: 0, padding: 12, background: 'none', overflowX: 'auto', overflowY: 'auto', maxHeight: 'calc(1.6em * 8 + 24px)', fontSize: '95%', borderRadius: 4}}>
+                              <code className={`language-${seg.lang}`}>{seg.code}</code>
+                            </pre>
+                          </div>
+                        )
+                      )}
+                      {msg.confidence && (
+                        <div className="mt-1 text-xs text-gray-500">
+                          置信度：{Math.round(msg.confidence * 100)}%
+                        </div>
+                      )}
                     </div>
+                  </div>
+                )
+              }
+              // 恢复user和system消息渲染
+              return (
+                <div key={index} className={`flex items-start space-x-3 mb-4 ${msg.role === 'user' ? 'justify-end' : ''}`}>
+                  {msg.role !== 'user' && (
+                    <Avatar icon={msg.role === 'system' ? <InboxOutlined /> : <RobotOutlined />} 
+                           className={msg.role === 'system' ? 'bg-blue-500' : 'bg-green-500'} />
+                  )}
+                  <div className={`max-w-[70%] ${msg.role === 'user' ? 'bg-blue-500 text-white' : 'bg-white'} p-3 rounded-lg shadow`}>
+                    <div className="markdown-body">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+                    </div>
+                  </div>
+                  {msg.role === 'user' && (
+                    <Avatar icon={<UserOutlined />} className="bg-blue-500" />
                   )}
                 </div>
-                {msg.role === 'user' && (
-                  <Avatar icon={<UserOutlined />} className="bg-blue-500" />
-                )}
-              </div>
-            ))}
+              );
+            })}
             <div ref={messagesEndRef} />
           </div>
 
-          <div className="flex space-x-2">
+          {/* 输入框和发送按钮区域 */}
+          <div className="flex space-x-2 mt-4">
             <TextArea
               value={state.question}
               onChange={handleQuestionChange}
@@ -290,26 +384,37 @@ export const QA: React.FC = () => {
               placeholder="请输入您的问题..."
               autoSize={{ minRows: 1, maxRows: 3 }}
               className="flex-1"
+              disabled={inputDisabled}
             />
-            <Button
-              type="primary"
-              onClick={handleSubmit}
-              loading={state.isLoading}
-              disabled={!state.question.trim() || !state.data}
-              icon={<SendOutlined />}
-              className="flex-shrink-0"
-            >
-              发送
-            </Button>
+            {state.isLoading ? (
+              <Button
+                type="primary"
+                danger
+                onClick={handleAbort}
+                loading={isAborting}
+                disabled={isAborting}
+                icon={<SendOutlined />}
+                className="flex-shrink-0"
+              >
+                打断
+              </Button>
+            ) : (
+              <Button
+                type="primary"
+                onClick={handleSubmit}
+                disabled={!state.question.trim() || inputDisabled}
+                icon={<SendOutlined />}
+                className="flex-shrink-0"
+              >
+                发送
+              </Button>
+            )}
           </div>
-
           {state.error && (
-            <div className="text-red-500 text-sm">{state.error}</div>
+            <div className="text-red-500 text-sm mt-2">{state.error}</div>
           )}
         </div>
       </div>
     </div>
   )
 }
-
-export default QA 

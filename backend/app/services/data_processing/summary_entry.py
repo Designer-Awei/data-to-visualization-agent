@@ -6,6 +6,16 @@ import sys
 import json
 import pandas as pd
 from summary import generate_summary
+import numpy as np
+
+def nan_to_none(obj):
+    if isinstance(obj, float) and (np.isnan(obj) or obj is None):
+        return None
+    if isinstance(obj, dict):
+        return {k: nan_to_none(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [nan_to_none(v) for v in obj]
+    return obj
 
 
 def main():
@@ -21,6 +31,7 @@ def main():
             data = json.load(f)
         df = pd.DataFrame(data)
         summary = generate_summary(df)
+        summary = nan_to_none(summary)
         print(json.dumps(summary, ensure_ascii=False))
     except Exception as e:
         print(json.dumps({'error': str(e)}))
