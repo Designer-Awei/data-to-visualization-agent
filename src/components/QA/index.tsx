@@ -5,13 +5,17 @@
 'use client'
 
 import React, { useState } from 'react'
-import { Input, Button, Card, Spin, Alert, Typography, Select } from 'antd'
-import { SendOutlined } from '@ant-design/icons'
-import { QAState, QAResponse } from '@/types/qa'
+import { Input, Button, Card, Spin, Alert, Typography, Select, Upload } from 'antd'
+import { SendOutlined, InboxOutlined } from '@ant-design/icons'
+import { QAState, QAResponse, DataState } from '@/types/qa'
+import type { UploadProps } from 'antd'
+import { message } from 'antd'
+import ReactMarkdown from 'react-markdown'
 
 const { TextArea } = Input
-const { Title, Text } = Typography
+const { Title, Text, Paragraph } = Typography
 const { Option } = Select
+const { Dragger } = Upload
 
 export const QA: React.FC = () => {
   const [state, setState] = useState<QAState>({
@@ -19,7 +23,8 @@ export const QA: React.FC = () => {
     isLoading: false,
     error: null,
     answer: null,
-    model: 'THUDM/GLM-4-9B-0414' // 默认模型
+    model: 'THUDM/GLM-4-9B-0414', // 默认模型
+    data: null
   })
 
   /**
@@ -42,6 +47,37 @@ export const QA: React.FC = () => {
       model: value,
       error: null
     }))
+  }
+
+  // 文件上传配置
+  const uploadProps: UploadProps = {
+    name: 'file',
+    multiple: false,
+    action: '/api/data/upload',
+    accept: '.csv,.xlsx,.xls',
+    onChange(info) {
+      const { status } = info.file
+      if (status === 'uploading') {
+        setState(prev => ({ ...prev, isLoading: true }))
+      }
+      if (status === 'done') {
+        const responseData = info.file.response.data as DataState
+        setState(prev => ({
+          ...prev,
+          isLoading: false,
+          data: responseData,
+          error: null
+        }))
+        message.success(`${info.file.name} 文件解析成功`)
+      } else if (status === 'error') {
+        setState(prev => ({
+          ...prev,
+          isLoading: false,
+          error: `${info.file.name} 文件上传失败`
+        }))
+        message.error(`${info.file.name} 文件上传失败`)
+      }
+    }
   }
 
   /**
@@ -70,7 +106,8 @@ export const QA: React.FC = () => {
         },
         body: JSON.stringify({
           question: state.question,
-          model: state.model
+          model: state.model,
+          data: state.data?.rows // 将解析后的数据传递给问答API
         }),
       })
 
@@ -95,74 +132,133 @@ export const QA: React.FC = () => {
   }
 
   return (
-    <div className="p-4">
-      <Title level={3}>智能问答</Title>
-      <div className="mb-4">
-        <div className="mb-4">
-          <label className="block text-sm font-medium text-gray-700 mb-2">选择模型</label>
-          <Select
-            value={state.model}
-            onChange={handleModelChange}
-            style={{ width: '100%' }}
-            className="mb-4"
-          >
-            <Option value="THUDM/GLM-4-9B-0414">THUDM/GLM-4-9B-0414 (默认，32K文本，免费)</Option>
-            <Option value="Qwen/Qwen2.5-7B-Instruct">Qwen/Qwen2.5-7B-Instruct (备选，32K文本，免费)</Option>
-            <Option value="THUDM/GLM-Z1-32B-0414">THUDM/GLM-Z1-32B-0414 (备选，32K文本，付费)</Option>
-            <Option value="deepseek-ai/DeepSeek-V3">deepseek-ai/DeepSeek-V3 (备选，64k文本，付费)</Option>
-          </Select>
-        </div>
-        <TextArea
-          value={state.question}
-          onChange={handleQuestionChange}
-          placeholder="请输入您的问题..."
-          autoSize={{ minRows: 3, maxRows: 6 }}
-          className="mb-2"
-        />
-        <Button 
-          type="primary"
-          icon={<SendOutlined />}
-          onClick={handleSubmit}
-          loading={state.isLoading}
-          className="mt-2"
-        >
-          提交问题
-        </Button>
+    <div className="space-y-6">
+      {/* 文件上传区域 */}
+      <div className="bg-white p-6 rounded-lg shadow-sm">
+        <h3 className="text-lg font-medium mb-4">上传数据</h3>
+        <Dragger {...uploadProps}>
+          <p className="ant-upload-drag-icon">
+            <InboxOutlined />
+          </p>
+          <p className="ant-upload-text">点击或拖拽文件到此区域上传</p>
+          <p className="ant-upload-hint">支持 Excel 和 CSV 格式的数据文件</p>
+        </Dragger>
+        
+        {/* 数据预览 */}
+        {state.data && state.data.rows && state.data.columns && (
+          <div className="mt-4">
+            <div className="flex justify-between items-center mb-2">
+              <h4 className="text-sm font-medium">数据预览</h4>
+              <span className="text-sm text-gray-500">
+                共 {state.data.totalRows} 条数据
+              </span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-50">
+                  <tr>
+                    {state.data.columns.map((column: string) => (
+                      <th
+                        key={column}
+                        className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
+                      >
+                        {column}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-200">
+                  {state.data.rows.slice(0, 5).map((row: Record<string, any>, index: number) => (
+                    <tr key={index}>
+                      {state.data!.columns.map((column: string) => (
+                        <td key={column} className="px-3 py-2 whitespace-nowrap text-sm text-gray-500">
+                          {row[column]}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
       </div>
 
-      {state.error && (
-        <Alert type="error" message={state.error} className="mb-4" />
-      )}
+      {/* 问答区域 */}
+      <div className="bg-white p-6 rounded-lg shadow-sm">
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              选择模型
+            </label>
+            <Select
+              value={state.model}
+              onChange={handleModelChange}
+              className="w-full"
+              options={[
+                { 
+                  value: 'THUDM/GLM-4-9B-0414', 
+                  label: 'THUDM/GLM-4-9B-0414 (默认，32K文本，免费)' 
+                },
+                { 
+                  value: 'Qwen/Qwen2.5-7B-Instruct', 
+                  label: 'Qwen/Qwen2.5-7B-Instruct (备选，32K文本，免费)' 
+                },
+                { 
+                  value: 'THUDM/GLM-Z1-32B-0414', 
+                  label: 'THUDM/GLM-Z1-32B-0414 (备选，32K文本，付费)' 
+                },
+                { 
+                  value: 'deepseek-ai/DeepSeek-V3', 
+                  label: 'deepseek-ai/DeepSeek-V3 (备选，64k文本，付费)' 
+                }
+              ]}
+            />
+          </div>
 
-      {state.isLoading && (
-        <div className="text-center">
-          <Spin size="large" />
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              输入问题
+            </label>
+            <TextArea
+              value={state.question}
+              onChange={handleQuestionChange}
+              placeholder="请输入您的问题..."
+              autoSize={{ minRows: 3, maxRows: 6 }}
+            />
+          </div>
+
+          <Button
+            type="primary"
+            onClick={handleSubmit}
+            loading={state.isLoading}
+            disabled={!state.question.trim() || !state.data}
+            className="w-full"
+          >
+            提交问题
+          </Button>
+
+          {state.error && (
+            <div className="text-red-500 text-sm">{state.error}</div>
+          )}
+
+          {state.answer && (
+            <div className="mt-4 space-y-2">
+              <Title level={4}>回答：</Title>
+              <div className="p-4 bg-gray-50 rounded-lg">
+                <Paragraph>
+                  <ReactMarkdown>{state.answer.answer}</ReactMarkdown>
+                </Paragraph>
+                {state.answer.confidence && (
+                  <div className="mt-2 text-sm text-gray-500">
+                    置信度：{Math.round(state.answer.confidence * 100)}%
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </div>
-      )}
-
-      {state.answer && !state.isLoading && (
-        <Card title="答案" className="mb-4">
-          <Text>{state.answer.answer}</Text>
-          {state.answer.confidence && (
-            <div className="mt-2">
-              <Text type="secondary">置信度: {(state.answer.confidence * 100).toFixed(1)}%</Text>
-            </div>
-          )}
-          {state.answer.relatedData && state.answer.relatedData.length > 0 && (
-            <div className="mt-4">
-              <Title level={5}>相关数据</Title>
-              <ul>
-                {state.answer.relatedData.map((item, index) => (
-                  <li key={index}>
-                    <Text>{JSON.stringify(item.row)}</Text>
-                    <Text type="secondary"> (相关度: {(item.relevance * 100).toFixed(1)}%)</Text>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-        </Card>
-      )}
+      </div>
     </div>
   )
 }

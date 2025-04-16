@@ -3,7 +3,6 @@
  */
 import { NextResponse } from 'next/server'
 import { OpenAI } from 'openai'
-import { LLMModel } from '@/types/qa'
 
 // 初始化OpenAI客户端
 const client = new OpenAI({
@@ -11,37 +10,9 @@ const client = new OpenAI({
   baseURL: 'https://api.siliconflow.cn/v1'
 })
 
-/**
- * 获取模型参数配置
- */
-function getModelConfig(model: LLMModel) {
-  // 基础配置，用于防止乱码
-  const baseConfig = {
-    temperature: 0.7,    // 控制创造性
-    top_p: 0.9,         // 核采样，仅考虑概率累积90%的词集
-    top_k: 50,          // 只保留概率最高的50个token
-    frequency_penalty: 0.5, // 降低重复内容的概率
-    stream: true        // 启用流式输出防止超时
-  }
-
-  // 根据不同模型设置最大token限制
-  switch (model) {
-    case 'THUDM/GLM-4-9B-0414':
-      return { ...baseConfig, max_tokens: 4096 }
-    case 'Qwen/Qwen2.5-7B-Instruct':
-      return { ...baseConfig, max_tokens: 4096 }
-    case 'THUDM/GLM-Z1-32B-0414':
-      return { ...baseConfig, max_tokens: 8192 }
-    case 'deepseek-ai/DeepSeek-V3':
-      return { ...baseConfig, max_tokens: 16384 }
-    default:
-      return { ...baseConfig, max_tokens: 4096 }
-  }
-}
-
 export async function POST(request: Request) {
   try {
-    const { question, model = 'THUDM/GLM-4-9B-0414' } = await request.json()
+    const { question, model = 'THUDM/GLM-4-9B-0414', data } = await request.json()
 
     if (!question) {
       return NextResponse.json(
@@ -50,16 +21,65 @@ export async function POST(request: Request) {
       )
     }
 
-    // 获取模型配置
-    const modelConfig = getModelConfig(model as LLMModel)
+    if (!data || !Array.isArray(data) || data.length === 0) {
+      return NextResponse.json(
+        { error: '请先上传数据' },
+        { status: 400 }
+      )
+    }
+
+    // 构建数据摘要
+    const dataSummary = {
+      totalRows: data.length,
+      columns: Object.keys(data[0]),
+      sampleData: data.slice(0, 5), // 前5条数据作为样本
+      dataStats: {}
+    }
+
+    // 计算每列的基本统计信息
+    for (const column of dataSummary.columns) {
+      const values = data.map(row => row[column])
+      const numericValues = values.filter(v => !isNaN(Number(v)))
+      
+      dataSummary.dataStats[column] = {
+        type: numericValues.length === values.length ? 'numeric' : 'categorical',
+        uniqueValues: new Set(values).size,
+        hasNulls: values.some(v => v === null || v === undefined || v === ''),
+        ...(numericValues.length > 0 && {
+          min: Math.min(...numericValues),
+          max: Math.max(...numericValues),
+          avg: numericValues.reduce((a, b) => a + Number(b), 0) / numericValues.length
+        })
+      }
+    }
 
     // 构建系统提示词
-    const systemPrompt = `你是一个专业的数据分析助手。请根据用户的问题提供准确、专业的回答。
-回答要求：
-1. 保持客观专业
-2. 如果涉及数据分析，请给出分析思路
-3. 如果不确定，请明确说明
-4. 回答要简洁清晰，避免冗长
+    const systemPrompt = `你是一个专业的数据分析助手。我会给你一些数据和问题，请你帮我分析数据并回答问题。
+
+数据概述：
+- 总行数：${dataSummary.totalRows}
+- 列名：${dataSummary.columns.join(', ')}
+
+数据统计信息：
+${Object.entries(dataSummary.dataStats)
+  .map(([col, stats]) => `${col}: 
+  - 类型: ${stats.type}
+  - 唯一值数量: ${stats.uniqueValues}
+  - 是否包含空值: ${stats.hasNulls}
+  ${stats.type === 'numeric' ? `- 最小值: ${stats.min}\n  - 最大值: ${stats.max}\n  - 平均值: ${stats.avg.toFixed(2)}` : ''}`)
+  .join('\n')}
+
+样本数据：
+${JSON.stringify(dataSummary.sampleData, null, 2)}
+
+完整数据集：
+${JSON.stringify(data)}
+
+要求：
+1. 基于提供的数据进行分析和回答
+2. 如果需要可视化，请说明使用什么类型的图表更合适
+3. 回答要客观专业，给出具体的数据支持
+4. 如果数据不足以回答问题，请明确指出
 5. 使用中文回答`
 
     try {
@@ -75,27 +95,26 @@ export async function POST(request: Request) {
             content: question
           }
         ],
-        ...modelConfig
+        temperature: 0.7,
+        top_p: 0.9,
+        top_k: 50,
+        frequency_penalty: 0.5,
+        stream: false,
+        max_tokens: 4096
       })
 
-      // 处理流式响应
-      let fullResponse = ''
-      for await (const chunk of completion) {
-        if (chunk.choices[0]?.delta?.content) {
-          fullResponse += chunk.choices[0].delta.content
-        }
-      }
-
-      // 计算一个简单的置信度（基于回答长度和完整性）
+      const answer = completion.choices[0]?.message?.content || ''
+      
+      // 计算置信度（基于回答的完整性和数据支持）
       const confidence = Math.min(
         0.95,
-        Math.max(0.6, fullResponse.length / 1000)
+        Math.max(0.6, answer.length / 1000)
       )
 
       return NextResponse.json({
-        answer: fullResponse,
+        answer,
         confidence,
-        relatedData: [] // 如果有相关数据可以在这里添加
+        relatedData: dataSummary.sampleData // 返回样本数据作为相关数据
       })
 
     } catch (error: any) {
@@ -139,4 +158,4 @@ export async function POST(request: Request) {
       { status: 500 }
     )
   }
-} 
+}

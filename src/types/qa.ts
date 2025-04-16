@@ -3,7 +3,7 @@
  */
 
 export interface RelatedDataItem {
-  row: any
+  row: Record<string, any>
   relevance: number
 }
 
@@ -14,12 +14,19 @@ export interface QAResponse {
   error?: string
 }
 
+export interface DataState {
+  columns: string[]
+  rows: Record<string, any>[]
+  totalRows: number
+}
+
 export interface QAState {
   question: string
   isLoading: boolean
   error: string | null
   answer: QAResponse | null
   model: string
+  data: DataState | null
 }
 
 export type LLMModel = 
