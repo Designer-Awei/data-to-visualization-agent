@@ -2,54 +2,98 @@
 
 ## 项目简介
 
-这是一个基于Next.js和Python的数据可视化智能助手系统。用户可以上传Excel表格或直接输入数据，系统将自动进行数据清洗、可视化和智能问答。
+本项目基于 Next.js (Node.js) 全栈一体化架构，所有后端 API 路由均在 `src/app/api` 下实现，**不再依赖 Python FastAPI**。Python 仅作为 plotly 代码执行器，由 Node.js 调用。
 
-### 超大数据量智能问答与可视化实现方案
+---
 
-#### 1. 问题背景
+## 实现路径与阶段目标
 
-当用户上传的Excel/CSV数据量远超大模型（如SiliconFlow LLM）的输入限制（如32k tokens）时，无法直接将全部数据传递给大模型进行问答或绘图。为保证智能问答和可视化的准确性与效率，需要采用"摘要+检索+采样"的分层处理方案。
+### 1. 数据上传与摘要
+- 支持 Excel/CSV 文件上传，Node.js 解析为结构化数据。
+- 用 JS 实现字段统计、分布、极值、缺失等摘要。
+- 摘要和样本数据直接返回前端。
 
-#### 2. 推荐架构与处理流程
+### 2. 智能问答
+- Node.js API 路由 `/api/qa/ask` 调用 SiliconFlow LLM，基于数据和用户问题返回自然语言答案。
+- 支持大数据场景下的字段/片段检索与摘要拼接。
 
-##### 2.1 数据上传与预处理
-- 后端解析Excel/CSV为结构化数据（如二维数组或DataFrame），并存储原始数据。
-- 自动生成数据摘要（如字段统计、分布、极值、缺失值等）和代表性样本行（如前10行、后10行、随机10行）。
-- 对于超大数据，按行或字段分块，便于后续检索。
+### 3. 智能绘图
+- Node.js API 路由 `/api/visualization/create`：
+  - 先用 LLM 生成 plotly 代码。
+  - Node.js 用 `child_process.spawn` 执行 Python，仅用于 plotly 代码执行，返回 figure json。
+- 前端用 react-plotly.js 渲染后端返回的 figure json。
 
-##### 2.2 智能问答流程
-- 用户输入自然语言问题。
-- 后端先用规则/简单NLP/向量检索，判断问题涉及哪些字段、哪些数据片段。
-- 仅将相关字段/片段和数据摘要拼接到prompt中，和问题一起发给LLM。
-- LLM基于摘要和样本回答问题，前端用Markdown渲染答案。
+### 4. 意图识别与自动分流
+- 所有前端问题统一 POST 到 `/api/qa`。
+- 后端"意图识别agent"判断是问答还是绘图，自动分流到 `/api/qa/ask` 或 `/api/visualization/create`。
+- 意图识别结果以日志形式输出，便于调试。
 
-##### 2.3 智能绘图流程
-- 用户指定图表类型和字段。
-- 后端对大数据先聚合/采样，仅返回绘图所需的关键信息。
-- 前端用聚合后的数据渲染图表，避免全量数据前端处理。
+### 5. 计算agent（保障数值计算准确性）
+- LLM 只负责理解用户意图、提取所需数据、生成对应的 Python 代码（如均值、分组、聚合等）。
+- 后端安全执行 LLM 生成的代码，得到真实计算结果。
+- 可选：将结果和代码一并返回给 LLM，让其组织最终自然语言答案。
+- 返回真实计算结果给前端，确保所有数值分析100%准确。
 
-#### 3. 关键点与注意事项
-- 不要直接将全部数据塞进prompt，否则会被截断或报错。
-- 摘要+检索+采样是大数据场景下的最佳实践。
-- 后端需具备"数据检索"能力，如字段过滤、向量检索、分组统计等。
-- 前端应有"数据量提示"，如"当前仅分析部分数据，若需全量分析请缩小范围"。
+### 6. 前端 fetch 路径规范
+- 所有 fetch 路径均为 `/api/xxx`，无端口号，无跨端口。
 
-#### 4. 参考文档
-- [SiliconFlow官方文档-输入限制](https://docs.siliconflow.cn/cn/userguide/capabilities/text-generation)
-- [RAG（检索增强生成）原理](https://zhuanlan.zhihu.com/p/671857964)
-- [数据摘要与采样方法](https://en.wikipedia.org/wiki/Sampling_(statistics))
+---
 
-### 主要功能
+## 主要功能模块
+- 数据上传与预览
+- 智能数据摘要
+- 智能问答
+- 智能绘图（自动识别需求、自动生成、自动渲染）
+- 智能计算（自动代码生成+后端安全执行）
+- 图表导出（PNG/SVG/HTML）
 
-- 📊 数据上传与预览：支持Excel、CSV等多种格式
-- 🧹 智能数据清洗：支持自动和手动清洗模式
-- 📈 数据可视化：支持多种图表类型，支持自然语言描述生成图表
-- 💾 图表导出：支持PNG、SVG、HTML等多种格式
-- 🤖 智能问答：基于数据的自然语言分析和问答
+---
+
+## 开发环境配置
+- Node.js 18+
+- npm 或 yarn
+- Python（仅用于 plotly 代码执行，无需 FastAPI）
+
+---
+
+## 快速开始
+```bash
+npm install
+npm run dev
+```
+
+---
+
+## 环境变量配置
+```
+SILICONFLOW_API_KEY=your_api_key
+MODEL_NAME=THUDM/GLM-Z1-32B-0414
+```
+
+---
+
+## 注意事项
+- 所有 API 路由均为 Node.js 实现，Python 仅用于 plotly/计算代码执行。
+- 前端 fetch 路径统一为 `/api/xxx`。
+- 项目无任何 FastAPI 依赖。
+
+---
+
+## 贡献指南
+1. Fork 项目
+2. 创建特性分支
+3. 提交改动
+4. 推送到分支
+5. 提交 Pull Request
+
+---
+
+## License
+MIT License
 
 ## 技术架构
 
-### 前端 (Frontend)
+### 前端 + 后端 (一体化 Next.js)
 ```
 frontend/
 ├── components/   # 可复用组件
@@ -61,108 +105,30 @@ frontend/
 ├── pages/        # 页面
 ├── utils/        # 工具函数
 ├── services/     # API 封装
-└── styles/       # 样式文件
+├── styles/       # 样式文件
+└── app/
+    └── api/      # 所有后端API路由 (Node.js)
+        ├── data/
+        ├── qa/
+        └── visualization/
 ```
 
-### 后端 (Backend)
-```
-backend/
-├── app/
-│   ├── api/           # API路由
-│   ├── services/      # 业务逻辑
-│   │   ├── data_processing/  # 数据处理
-│   │   ├── visualization/    # 可视化服务
-│   │   └── qa/               # 问答服务
-│   └── utils/         # 工具函数
-├── requirements.txt   # Python依赖
-└── README.md         # 后端说明文档
-```
+## 随机数据表格生成工具
 
-## 开发环境配置
+本项目已内置一个用于测试的随机学生成绩表格生成脚本，位于 `create-random-xlsx` 文件夹下。
 
-### 前端环境要求
-- Node.js 18+
-- npm 或 yarn
+### 使用方法
 
-### 后端环境要求
-- Python 3.8+
-- FastAPI
-- pandas
-- matplotlib/seaborn/plotly
-- SiliconFlow API
-
-## 快速开始
-
-### 前端启动
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-### 后端启动
-```bash
-cd backend
-python -m venv venv
-venv\Scripts\activate  # Windows
-pip install -r requirements.txt
-python main.py
-```
-
-## 环境变量配置
-
-### 前端环境变量 (.env.local)
-```
-NEXT_PUBLIC_API_URL=http://localhost:8000
-```
-
-### 后端环境变量 (.env)
-```
-SILICONFLOW_API_KEY=your_api_key
-MODEL_NAME=THUDM/GLM-Z1-32B-0414
-```
-
-## API文档
-
-### 数据处理API
-- POST /api/data/upload - 上传数据文件
-- POST /api/data/clean - 数据清洗
-- GET /api/data/preview - 数据预览
-
-### 可视化API
-- POST /api/visualization/create - 创建可视化
-- GET /api/visualization/types - 获取支持的图表类型
-- POST /api/visualization/export - 导出图表
-
-### 问答API
-- POST /api/qa/ask - 提交问题
-- GET /api/qa/history - 获取问答历史
-
-## 注意事项
-
-1. 数据安全
-   - 所有上传的数据仅在会话内使用
-   - 定期清理临时文件
-   - 敏感数据加密存储
-
-2. API调用
-   - 使用SiliconFlow API时注意错误处理
-   - 实现请求重试机制
-   - 注意API调用频率限制
-
-3. 代码规范
-   - 使用ESLint和Prettier
-   - 遵循TypeScript类型检查
-   - 编写完整的单元测试
-
-## 贡献指南
-
-1. Fork 项目
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交改动 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 提交Pull Request
-
-## 许可证
-
-MIT License - 详见 [LICENSE](LICENSE) 文件 
+1. 进入目录：
+   ```bash
+   cd create-random-xlsx
+   ```
+2. 安装依赖：
+   ```bash
+   pip install pandas openpyxl
+   ```
+3. 运行脚本：
+   ```bash
+   python gen_random_excel.py
+   ```
+4. 生成的 `高三1班学生期末考试成绩.xlsx` 可用于上传测试智能绘图与问答功能。 

@@ -13,11 +13,14 @@ import { message } from 'antd'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import './qa-markdown.css'
+import dynamic from 'next/dynamic'
 
 const { TextArea } = Input
 const { Title, Text, Paragraph } = Typography
 const { Option } = Select
 const { Dragger } = Upload
+
+const Plot = dynamic(() => import('react-plotly.js'), { ssr: false })
 
 /**
  * 分割Markdown内容为有序片段数组，保留正文和代码块原始顺序
@@ -71,24 +74,17 @@ export const QA: React.FC = () => {
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
-  // 新增：自动滚动到最新消息
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
-  }
-
+  // 仅在成功生成图表时自动滚动到底部
   useEffect(() => {
-    scrollToBottom()
-    // 只在assistant新回复到来时输出一次原始内容
-    const lastMsg = state.messages[state.messages.length - 1]
-    if (lastMsg && lastMsg.role === 'assistant') {
-      // eslint-disable-next-line no-console
-      console.log('LLM原始返回内容:', lastMsg.content)
+    if (state.plotlyFigure) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
     }
-  }, [state.messages])
+  }, [state.plotlyFigure])
 
   const [inputDisabled, setInputDisabled] = useState(false) // 是否禁用输入
   const [abortController, setAbortController] = useState<AbortController | null>(null) // 控制fetch中断
   const [isAborting, setIsAborting] = useState(false) // 是否正在打断
+  const [plotlyFigure, setPlotlyFigure] = useState<any>(null)
 
   /**
    * 处理问题输入变化
@@ -142,7 +138,16 @@ export const QA: React.FC = () => {
           isLoading: false,
           error: `${info.file.name} 文件上传失败`
         }))
-        message.error(`${info.file.name} 文件上传失败`)
+        // 新增：输出后端返回的详细错误到浏览器控制台
+        const errorMsg = info.file?.response?.error
+        if (errorMsg) {
+          // 控制台输出详细后端错误
+          // eslint-disable-next-line no-console
+          console.error(`[文件上传] 后端返回错误: ${errorMsg}`)
+          message.error(`${info.file.name} 上传失败: ${errorMsg}`)
+        } else {
+          message.error(`${info.file.name} 文件上传失败`)
+        }
       }
     }
   }
@@ -195,6 +200,7 @@ export const QA: React.FC = () => {
       }))
       setInputDisabled(false)
       setAbortController(null)
+      if (data.plotly_figure) setPlotlyFigure(data.plotly_figure)
     } catch (error: any) {
       if (error.name === 'AbortError') {
         setState(prev => ({ ...prev, isLoading: false, error: '回复已被打断' }))
@@ -414,6 +420,31 @@ export const QA: React.FC = () => {
             <div className="text-red-500 text-sm mt-2">{state.error}</div>
           )}
         </div>
+      </div>
+
+      <div className="bg-white p-6 rounded-lg shadow mt-6">
+        <h3 className="text-lg font-medium mb-2">图表预览</h3>
+        {plotlyFigure ? (
+          <>
+            <Plot data={plotlyFigure.data} layout={plotlyFigure.layout} style={{width: '100%', height: '480px'}} config={{responsive: true}} />
+            <div className="flex gap-2 mt-2">
+              <button
+                className="px-3 py-1 bg-blue-500 text-white rounded"
+                onClick={() => window.Plotly && window.Plotly.downloadImage(document.querySelector('.js-plotly-plot'), {format: 'png', filename: 'chart'})}
+              >下载PNG</button>
+              <button
+                className="px-3 py-1 bg-green-500 text-white rounded"
+                onClick={() => window.Plotly && window.Plotly.downloadImage(document.querySelector('.js-plotly-plot'), {format: 'svg', filename: 'chart'})}
+              >下载SVG</button>
+              <button
+                className="px-3 py-1 bg-gray-500 text-white rounded"
+                onClick={() => window.Plotly && window.Plotly.downloadImage(document.querySelector('.js-plotly-plot'), {format: 'html', filename: 'chart'})}
+              >下载HTML</button>
+            </div>
+          </>
+        ) : (
+          <div className="text-gray-400 text-center py-20">暂无图表，请在上方提问并生成图表后预览和下载。</div>
+        )}
       </div>
     </div>
   )
