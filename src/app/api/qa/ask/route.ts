@@ -1,5 +1,4 @@
 import { NextResponse } from 'next/server'
-import { OpenAI } from 'openai'
 import { spawn } from 'child_process'
 import fs from 'fs'
 import path from 'path'
@@ -48,22 +47,30 @@ async function runPythonCode(code: string, data: any[]): Promise<any> {
 
 /**
  * 让LLM判断问题类型：是否需要数值计算、分析，还是两者都要
- * @param {OpenAI} client
  * @param {string} question
  * @returns {Promise<'calc'|'analysis'|'both'>}
  */
-async function judgeQuestionType(client: any, question: string): Promise<'calc'|'analysis'|'both'> {
+async function judgeQuestionType(question: string): Promise<'calc'|'analysis'|'both'> {
   const prompt = `请判断下述用户问题属于哪一类，只能返回如下JSON：{ "type": "calc" }、{ "type": "analysis" } 或 { "type": "both" }。\n- "calc"表示需要数值计算（如均值、总分、差值等）\n- "analysis"表示只需分析总结数据亮点，无需计算\n- "both"表示既要计算又要分析\n用户问题：${question}`
-  const res = await client.chat.completions.create({
-    model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
-    messages: [
-      { role: 'system', content: '你是问题类型判断agent，只返回JSON结构。' },
-      { role: 'user', content: prompt }
-    ],
-    temperature: 0.2,
-    max_tokens: 64
+  const res = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${process.env.SILICONFLOW_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
+      messages: [
+        { role: 'system', content: '你是问题类型判断agent，只返回JSON结构。' },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0.2,
+      max_tokens: 64
+    })
   })
-  let typeJson = res.choices[0]?.message?.content || ''
+  if (!res.ok) throw new Error(await res.text())
+  const data = await res.json()
+  let typeJson = data.choices[0]?.message?.content || ''
   try {
     typeJson = typeJson.replace(/```json|```/g, '').trim()
     const { type } = JSON.parse(typeJson)
@@ -76,31 +83,88 @@ async function judgeQuestionType(client: any, question: string): Promise<'calc'|
 
 /**
  * 用LLM辅助从用户问题中提取字段名
- * @param {OpenAI} client
  * @param {string} question
  * @param {string[]} allFields
+ * @param {any[]} [dataRows] - 可选，数据样本，用于判断数值型字段
  * @returns {Promise<string[]>}
  */
-async function extractFieldsFromQuestion(client: any, question: string, allFields: string[]): Promise<string[]> {
-  const prompt = `请从下列问题中提取所有涉及的字段名，字段名必须严格来自于：${allFields.join('、')}，只返回JSON数组。\n用户问题：${question}`
-  const res = await client.chat.completions.create({
-    model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
-    messages: [
-      { role: 'system', content: '你是字段提取agent，只返回JSON数组。' },
-      { role: 'user', content: prompt }
-    ],
-    temperature: 0.2,
-    max_tokens: 128
+async function extractFieldsFromQuestion(question: string, allFields: string[], dataRows?: any[]): Promise<string[]> {
+  // 极简prompt
+  const prompt = `你的任务是根据用户问题，从提供的"可用字段[]"中选取计算时需要的字段，放到"提取结果[]"下——\n用户问题: ${question}\n可用字段: ${JSON.stringify(allFields, null, 2)}\n提取结果: `
+  const res = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${process.env.SILICONFLOW_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
+      messages: [
+        { role: 'system', content: '你是字段提取agent，只返回JSON数组。' },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0.2,
+      max_tokens: 128
+    })
   })
-  let arrJson = res.choices[0]?.message?.content || '[]'
+  if (!res.ok) throw new Error(await res.text())
+  const data = await res.json()
+  let arrJson = data.choices[0]?.message?.content || '[]'
   try {
     arrJson = arrJson.replace(/```json|```/g, '').trim()
     const arr = JSON.parse(arrJson)
-    if (Array.isArray(arr)) return arr
-    return []
+    // 关键增强：如果LLM返回["总分"]，则自动兜底为所有可用数值型字段
+    if (Array.isArray(arr) && arr.length === 1 && arr[0] === '总分' && dataRows && dataRows.length > 0) {
+      const sample = dataRows[0]
+      const numericFields = Object.keys(sample).filter(k => typeof sample[k] === 'number')
+      if (numericFields.length > 0) return numericFields
+    }
+    if (Array.isArray(arr) && arr.length > 0) return arr
+    // 兜底：如果字段提取为空，自动返回所有可用数值型字段
+    if (dataRows && dataRows.length > 0) {
+      const sample = dataRows[0]
+      const numericFields = Object.keys(sample).filter(k => typeof sample[k] === 'number')
+      if (numericFields.length > 0) return numericFields
+    }
+    return allFields
   } catch {
-    return []
+    // 兜底：如果解析失败，返回所有可用字段
+    return allFields
   }
+}
+
+/**
+ * 用fetch直连SiliconFlow LLM API，兼容OpenAI chat.completions.create参数
+ * @param {object} params - 请求参数，需包含model、messages等
+ * @param {number} [maxRetry=2] - 最大重试次数
+ * @returns {Promise<any>} - LLM响应
+ */
+async function callLLMWithRetry(params: any, maxRetry = 2) {
+  let lastError: any = null
+  let tryMessages = params.messages || []
+  for (let i = 0; i <= maxRetry; i++) {
+    try {
+      const res = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.SILICONFLOW_API_KEY}`
+        },
+        body: JSON.stringify({ ...params, messages: tryMessages, stream: false })
+      })
+      if (!res.ok) throw new Error(await res.text())
+      return await res.json()
+    } catch (e: any) {
+      lastError = e
+      // 只对400/500等API错误重试，每次重试都再裁剪掉最早一条
+      if (tryMessages.length > 1) {
+        tryMessages = tryMessages.slice(1)
+      } else {
+        break
+      }
+    }
+  }
+  throw lastError
 }
 
 /**
@@ -114,14 +178,9 @@ export async function POST(request: Request) {
     if (!question || typeof question !== 'string' || !question.trim()) {
       return NextResponse.json({ error: '请输入问题' }, { status: 400 })
     }
-    // 调用SiliconFlow LLM
-    const client = new OpenAI({
-      apiKey: process.env.SILICONFLOW_API_KEY,
-      baseURL: 'https://api.siliconflow.cn/v1'
-    })
     // 字段提取agent：每轮都动态识别本轮涉及字段
     const allFields = columns || (data[0] ? Object.keys(data[0]) : [])
-    const userFields = await extractFieldsFromQuestion(client, question, allFields)
+    const userFields = await extractFieldsFromQuestion(question, allFields, data)
     console.log('[字段提取agent] 用户问题:', question, '可用字段:', allFields, '提取结果:', userFields)
     // 检索本轮涉及字段的所有数据（前10条）
     const previewRows = (data || []).map((row: any) => {
@@ -132,27 +191,8 @@ export async function POST(request: Request) {
     const dataPreview = JSON.stringify(previewRows, null, 2)
     // 自动裁剪messages长度，避免token超限和污染
     const safeMessages = (messages || []).slice(-5)
-    // LLM API调用自动重试机制，所有调用都用safeMessages
-    const callLLMWithRetry = async (params: any, maxRetry = 2) => {
-      let lastError: any = null
-      let tryMessages = params.messages || safeMessages
-      for (let i = 0; i <= maxRetry; i++) {
-        try {
-          return await client.chat.completions.create({ ...params, messages: tryMessages })
-        } catch (e: any) {
-          lastError = e
-          // 只对400/500等API错误重试，每次重试都再裁剪掉最早一条
-          if (e && (e.status === 400 || e.status === 500) && tryMessages.length > 1) {
-            tryMessages = tryMessages.slice(1)
-          } else {
-            break
-          }
-        }
-      }
-      throw lastError
-    }
-    // 动态拼接到system prompt，强制LLM只能输出Python代码块，且最后必须有result=...和print(json.dumps(result, ensure_ascii=False))
-    let systemPrompt = `你是一个数据分析专家。无论用户如何提问，你只能输出Python代码块（用\`\`\`python ... \`\`\`包裹），且代码最后必须有如下格式：\nresult = {\n  "字段1": 值1,\n  "字段2": 值2,\n  ...\n}\nprint(json.dumps(result, ensure_ascii=False))\n不能输出其他print语句或分析文本，否则会被判为错误。`
+    // 动态拼接到system prompt，强制LLM只能输出Python代码块，且代码最后必须有result=...和print(json.dumps(result, ensure_ascii=False))
+    let systemPrompt = `你是一个数据分析专家。无论用户如何提问，你只能输出Python代码块（用\`\`\`python ... \`\`\`包裹），且代码最后必须有如下格式：\nresult = {\n  \"字段1\": 值1,\n  \"字段2\": 值2,\n  ...\n}\nprint(json.dumps(result, ensure_ascii=False))\n不能输出其他print语句或分析文本，否则会被判为错误。\n你只能直接使用变量 data（类型为 list[dict]，每个 dict 的 key 为字段名），禁止使用 pd.read_excel、open、os、path 等任何本地文件读取操作，不能写 data = pd.read_excel(...)、data = open(...) 等语句。`
     systemPrompt += `\n涉及字段：${userFields.join('、')}`
     systemPrompt += `\n数据示例：${dataPreview}`
     // messages只保留对话内容，不再拼接数据
@@ -161,14 +201,55 @@ export async function POST(request: Request) {
       ...safeMessages,
       { role: 'user', content: question }
     ]
+    /**
+     * 参数检查：确保每条message的content非空且为字符串，整体长度不超过8000字符
+     */
+    for (const m of conversationMessages) {
+      if (!m.content || typeof m.content !== 'string' || !m.content.trim()) {
+        throw new Error(`LLM请求参数错误：存在空content字段，role=${m.role}`)
+      }
+    }
+    const messagesStr = JSON.stringify(conversationMessages)
+    if (messagesStr.length > 8000) {
+      throw new Error(`LLM请求参数过大：messages总长度${messagesStr.length}，请减少字段或样本数量`)
+    }
+    // 打印实际传递给LLM的prompt内容，便于排查
+    console.log('[LLM请求messages]', messagesStr)
+    /**
+     * 防御性过滤：只保留content为非空字符串的message，避免空content导致参数无效
+     */
+    const filteredMessages = conversationMessages.filter(m => m.content && typeof m.content === 'string' && m.content.trim())
+    if (filteredMessages.length !== conversationMessages.length) {
+      console.warn('[LLM参数修正] 已自动过滤掉空content的message')
+    }
     let lastLLMAnswer = ''
     let lastCode = ''
     let lastError = ''
     let retry = 0
+    let result = undefined // 每次循环前清空
     while (retry < 3) {
+      result = undefined // 每次循环开始都清空，防止复用旧值
+      /**
+       * 循环内防御性过滤和参数检查：只保留content为非空字符串的message，避免空content导致参数无效
+       */
+      const filteredMessages = conversationMessages.filter(m => m.content && typeof m.content === 'string' && m.content.trim())
+      if (filteredMessages.length !== conversationMessages.length) {
+        console.warn('[LLM参数修正] 已自动过滤掉空content的message')
+      }
+      for (const m of filteredMessages) {
+        if (!m.content || typeof m.content !== 'string' || !m.content.trim()) {
+          throw new Error(`LLM请求参数错误：存在空content字段，role=${m.role}`)
+        }
+      }
+      const messagesStr = JSON.stringify(filteredMessages)
+      if (messagesStr.length > 8000) {
+        throw new Error(`LLM请求参数过大：messages总长度${messagesStr.length}，请减少字段或样本数量`)
+      }
+      // 打印实际传递给LLM的prompt内容，便于排查
+      console.log('[LLM请求messages]', messagesStr)
       const completion = await callLLMWithRetry({
         model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
-        messages: conversationMessages,
+        messages: filteredMessages,
         temperature: 0.3,
         max_tokens: 1024,
         top_p: 0.9,
@@ -184,10 +265,14 @@ export async function POST(request: Request) {
         // 校验代码是否包含result=和print(json.dumps(result
         if (!/result\s*=/.test(code) || !/print\s*\(\s*json\.dumps\s*\(\s*result/.test(code)) {
           retry++
-          conversationMessages.push({
-            role: 'assistant',
-            content: '请严格按要求输出：代码最后必须有result=...和print(json.dumps(result, ensure_ascii=False))，不能输出其他print或分析文本。'
-          })
+          // 失败时追加assistant消息前，判断content非空
+          const errorMsg = `上次生成的Python代码执行失败，错误信息：${lastError || '未知错误'}，请严格按要求输出：代码最后必须有result=...和print(json.dumps(result, ensure_ascii=False))，不能输出其他print或分析文本。`
+          if (errorMsg && typeof errorMsg === 'string' && errorMsg.trim()) {
+            conversationMessages.push({
+              role: 'assistant',
+              content: errorMsg
+            })
+          }
           continue
         }
         try {
@@ -197,18 +282,17 @@ export async function POST(request: Request) {
           const isSingleField = userFields.length === 1 && (typeof result === 'number' || (typeof result === 'object' && Object.keys(result).length === 1))
           // 判断是否为单一数值但有中间结果（如差值）
           const isDiffWithIntermediate = typeof result === 'number' && Array.isArray(messages) && messages.length > 0 && /平均分|差值|中间结果/.test(question)
+          // 结果溯源标记，确保传递给二次组织agent的结果100%来自Python
+          const resultSource = 'python'
+          // prompt中声明"下方计算结果为后端Python真实执行所得"
           let explainPrompt = ''
           if (isSingleField && !isDiffWithIntermediate) {
-            // 单字段，直接给出字段名和值，要求LLM照抄
             const fieldName = userFields[0] || (typeof result === 'object' ? Object.keys(result)[0] : '')
             const avg = typeof result === 'number' ? result : (typeof result === 'object' ? Object.values(result)[0] : '')
-            explainPrompt = `你是一名数据分析专家。请严格以如下JSON格式输出：\n{\n  \"table\": [\n    {\"科目\": \"${fieldName}\", \"平均分\": ${Number(avg).toFixed(2)}}\n  ],\n  \"analysis\": \"简明分析文本\"\n}\n请直接引用上方科目和平均分，不能写其他字段名。`;
-          } else if (typeof result === 'number') {
-            // 差值/总分等单一数值，需带中间结果
-            explainPrompt = `你是一名数据分析专家。请根据下方【计算结果】智能判断：\n- 如果【计算结果】是单一数值（如差值、总分等），请只输出如下JSON对象：\n  {\n    \"analysis\": \"简明分析文本，需引用所有中间结果和最终数值\"\n  }\n- 如果【计算结果】是对象（如多科目平均分），请输出如下JSON对象：\n  {\n    \"table\": [\n      {\"科目\": \"真实字段名\", \"平均分\": 数值},\n      ...\n    ],\n    \"analysis\": \"简明分析文本\"\n  }\n所有小数结果默认保留两位小数，analysis需引用所有中间结果和最终数值。请严格按照上述要求作答，只能输出JSON对象，不要输出多余内容。\n【计算结果】：${JSON.stringify(result, null, 2)}`;
+            explainPrompt = `你是一名数据分析专家。下方【计算结果】100%为后端Python真实执行所得，请严格以如下JSON格式输出：\n{\n  "table": [\n    {"字段": "${fieldName}", "值": ${Number(avg).toFixed(2)}}\n  ],\n  "analysis": "简明分析文本"\n}\n请直接引用上方字段和值，不能写其他字段名。`;
           } else {
-            // 多字段，按原有逻辑
-            explainPrompt = `你是一名数据分析专家。请严格以如下JSON格式输出：\n{\n  \"table\": [\n    {\"科目\": \"这里填写真实字段名\", \"平均分\": 数值},\n    ...\n  ],\n  \"analysis\": \"简明分析文本\"\n}\n所有小数结果默认保留两位小数，顺序与下方【计算结果】JSON一致，科目字段必须与【计算结果】中的key完全一致，不得写'字段名'或其他占位符。analysis需引用真实数值。\n【计算结果】：${JSON.stringify(result, null, 2)}\n请严格按照上述要求作答，只能输出JSON对象，不要输出多余内容。`;
+            // 自动适配：table每一行的key与【计算结果】中的key一致
+            explainPrompt = `你是一名数据分析专家。下方【计算结果】100%为后端Python真实执行所得，请严格以如下JSON格式输出：\n{\n  "table": [\n    {"字段名": "这里填写真实key", "值": 数值或对象},\n    ...\n  ],\n  "analysis": "简明分析文本"\n}\n所有小数结果默认保留两位小数，顺序与下方【计算结果】JSON一致，table每一行的key必须与【计算结果】中的key完全一致，不得写'字段名'或其他占位符。analysis需引用真实数值。\n【计算结果】：${JSON.stringify(result, null, 2)}\n请严格按照上述要求作答，只能输出JSON对象，不要输出多余内容。`;
           }
           console.log('[二次组织agent输入prompt]', explainPrompt)
           const explainCompletion = await callLLMWithRetry({
@@ -232,50 +316,65 @@ export async function POST(request: Request) {
             const parsed = JSON.parse(jsonStr)
             table = parsed.table || []
             analysis = parsed.analysis || ''
-            // 若无table和analysis，强制输出错误提示
             if (!table.length && !analysis) {
               throw new Error('LLM输出内容为空或格式不符')
             }
           } catch (e) {
-            // fallback: 兼容旧格式或异常，始终返回标准JSON
             analysis = `【LLM服务异常】输出内容解析失败：${e instanceof Error ? e.message : String(e)}，原始内容：${explainAnswer}`
           }
-          // 计算agent执行后，自动组装中间结果和最终结果
           let resultObj = result
           if (typeof result === 'number' && typeof (globalThis as any)._intermediateResults === 'object') {
-            // 若有全局中间结果，合并
             resultObj = { ...(globalThis as any)._intermediateResults, 差值: result }
           }
-          return NextResponse.json({ answer: { table, analysis }, code, result: resultObj })
+          // 返回结构中加入source: 'python'
+          return NextResponse.json({ answer: { table, analysis }, code, result: resultObj, source: resultSource })
         } catch (e) {
           lastError = e instanceof Error ? e.message : String(e)
           retry++
-          conversationMessages.push({ role: 'assistant', content: `上次生成的Python代码执行失败，错误信息：${lastError}，请严格按要求输出：代码最后必须有result=...和print(json.dumps(result, ensure_ascii=False))，不能输出其他print或分析文本。` })
+          // 失败时追加assistant消息前，判断content非空
+          const errorMsg = `上次生成的Python代码执行失败，错误信息：${lastError || '未知错误'}，请严格按要求输出：代码最后必须有result=...和print(json.dumps(result, ensure_ascii=False))，不能输出其他print或分析文本。`
+          if (errorMsg && typeof errorMsg === 'string' && errorMsg.trim()) {
+            conversationMessages.push({
+              role: 'assistant',
+              content: errorMsg
+            })
+          }
           continue
         }
       } else {
         // 没有代码，自动补assistant消息，强制LLM重试
-        retry++
-        conversationMessages.push({
-          role: 'assistant',
-          content: '请只输出Python代码块（用```python ... ```包裹），且代码最后必须有result=...和print(json.dumps(result, ensure_ascii=False))，不能输出其他print或分析文本。'
-        })
+        const retryMsg = '请只输出Python代码块（用```python ... ```包裹），且代码最后必须有result=...和print(json.dumps(result, ensure_ascii=False))，不能输出其他print或分析文本。'
+        if (retryMsg && typeof retryMsg === 'string' && retryMsg.trim()) {
+          conversationMessages.push({
+            role: 'assistant',
+            content: retryMsg
+          })
+        }
         continue
       }
     }
-    // 连续三次都失败，返回LLM口算结果并备注
-    return NextResponse.json({ answer: lastLLMAnswer + '\n【警告：自动代码执行连续失败，已返回LLM口算结果，可能不准确】', code: lastCode, error: lastError })
+    // 连续三次都失败，直接返回错误提示，不再返回LLM口算结果
+    return NextResponse.json({ error: '自动代码执行连续失败，请重试或联系管理员。', code: lastCode, detail: lastError }, { status: 500 })
   } catch (error) {
     console.error('智能问答API/计算agent错误:', error)
-    // 兜底：无论如何都返回标准JSON
+    // 兜底：无论如何都返回标准JSON，包含error、detail、code字段
     let errMsg = '处理问答请求时发生错误';
+    let detail = '';
+    let code = '';
     if (error instanceof Error) {
       errMsg = error.message || errMsg;
+      detail = (error as any).stack || '';
+      // 尝试解析API返回的JSON错误
+      try {
+        const parsed = JSON.parse(error.message)
+        if (parsed && parsed.message) errMsg = parsed.message
+        if (parsed && parsed.code) code = parsed.code
+        if (parsed && parsed.data) detail = JSON.stringify(parsed.data)
+      } catch {}
     } else if (typeof error === 'string') {
       errMsg = error;
     }
-    // 若异常内容为空，也要兜底
     if (!errMsg) errMsg = 'LLM API返回空响应';
-    return NextResponse.json({ error: errMsg }, { status: 500 })
+    return NextResponse.json({ error: errMsg, detail, code }, { status: 500 });
   }
 } 

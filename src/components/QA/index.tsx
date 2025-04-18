@@ -20,7 +20,12 @@ const { Title, Text, Paragraph } = Typography
 const { Option } = Select
 const { Dragger } = Upload
 
-const Plot = dynamic(() => import('react-plotly.js'), { ssr: false })
+// @ts-ignore
+// eslint-disable-next-line
+declare module 'react-plotly.js';
+
+// Plot 组件类型兼容 any
+const Plot: any = dynamic(() => import('react-plotly.js'), { ssr: false })
 
 /**
  * 分割Markdown内容为有序片段数组，保留正文和代码块原始顺序
@@ -61,15 +66,18 @@ function splitMarkdownSegments(content: string): Array<{type: 'text', content: s
   return segments;
 }
 
+type QAStateFixed = QAState & { plotlyFigure?: any }
+
 export const QA: React.FC = () => {
-  const [state, setState] = useState<QAState>({
+  const [state, setState] = useState<QAStateFixed>({
     question: '',
     isLoading: false,
     error: null,
     answer: null,
     model: 'THUDM/GLM-4-9B-0414',
     data: null,
-    messages: [] // 新增：存储对话历史
+    messages: [],
+    plotlyFigure: null
   })
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -84,7 +92,6 @@ export const QA: React.FC = () => {
   const [inputDisabled, setInputDisabled] = useState(false) // 是否禁用输入
   const [abortController, setAbortController] = useState<AbortController | null>(null) // 控制fetch中断
   const [isAborting, setIsAborting] = useState(false) // 是否正在打断
-  const [plotlyFigure, setPlotlyFigure] = useState<any>(null)
   const [showKeyModal, setShowKeyModal] = useState(false)
   const [apiKeyInput, setApiKeyInput] = useState('')
   const [apiKeyStatus, setApiKeyStatus] = useState<'idle'|'validating'|'success'|'error'>('idle')
@@ -175,10 +182,7 @@ export const QA: React.FC = () => {
           isLoading: false,
           data: responseData,
           error: null,
-          messages: [...prev.messages, {
-            role: 'system',
-            content: `已成功上传数据文件：${info.file.name}，共 ${responseData.totalRows} 条数据。`
-          }]
+          messages: [] // 上传新文件后自动清空历史消息
         }))
         message.success(`${info.file.name} 文件解析成功`)
       } else if (status === 'error') {
@@ -204,25 +208,37 @@ export const QA: React.FC = () => {
   /**
    * 提交问题到后端API
    * 发送后立即清空输入框并禁用输入，等待回复或打断后恢复
+   * 页面展示完整历史，API只发最近一轮问答
    * @returns {Promise<void>}
    */
   const handleSubmit = async () => {
     if (!state.question.trim() || state.isLoading) return
     setInputDisabled(true)
     setIsAborting(false)
-    // 过滤掉所有"【LLM服务异常】"开头的历史消息，避免污染对话记忆
-    const filteredMessages = state.messages.filter(
-      m => !(typeof m.content === 'string' && m.content.startsWith('【LLM服务异常】'))
-    )
+    // 页面展示：累加所有历史消息
     setState(prev => ({
       ...prev,
       isLoading: true,
       error: null,
       question: '',
-      messages: [...filteredMessages, { role: 'user', content: prev.question }]
+      messages: [...prev.messages, { role: 'user', content: prev.question }]
     }))
     const controller = new AbortController()
     setAbortController(controller)
+    // 构造仅最近一轮有效问答的 messages 作为 API 参数
+    let lastAssistantMsg: Message | null = null
+    for (let i = state.messages.length - 1; i >= 0; i--) {
+      const m = state.messages[i]
+      if (m.role === 'assistant' && m.content && typeof m.content === 'string' && m.content.trim()) {
+        lastAssistantMsg = m
+        break
+      }
+    }
+    const apiMessages: Message[] = lastAssistantMsg
+      ? [lastAssistantMsg, { role: 'user', content: state.question }]
+      : [{ role: 'user', content: state.question }]
+    // 防御性过滤
+    const safeApiMessages: Message[] = apiMessages.filter(m => m.content && typeof m.content === 'string' && m.content.trim())
     try {
       const response = await fetch('/api/qa', {
         method: 'POST',
@@ -231,7 +247,7 @@ export const QA: React.FC = () => {
           question: state.question,
           model: state.model,
           data: state.data?.rows,
-          messages: filteredMessages
+          messages: safeApiMessages
         }),
         signal: controller.signal
       })
@@ -255,7 +271,7 @@ export const QA: React.FC = () => {
               role: 'assistant',
               content: errorContent || '【LLM服务异常】未知错误',
               confidence: undefined
-            }
+            } as Message
           ]
         }))
         setInputDisabled(false)
@@ -276,7 +292,7 @@ export const QA: React.FC = () => {
       }))
       setInputDisabled(false)
       setAbortController(null)
-      if (data.plotly_figure) setPlotlyFigure(data.plotly_figure)
+      if ((data as any).plotly_figure) setState(prev => ({ ...prev, plotlyFigure: (data as any).plotly_figure }))
     } catch (error: any) {
       let errMsg = error?.message || '发生错误，请稍后重试'
       setState(prev => ({
@@ -284,12 +300,12 @@ export const QA: React.FC = () => {
         error: errMsg,
         isLoading: false,
         messages: [
-          ...prev.messages,
+          ...state.messages,
           {
             role: 'assistant',
             content: `【LLM服务异常】${errMsg || '未知错误'}`,
             confidence: undefined
-          }
+          } as Message
         ]
       }))
       setInputDisabled(false)
@@ -442,7 +458,7 @@ export const QA: React.FC = () => {
                   safeContent = '【LLM服务异常】未知错误'
                 }
                 // 结构化渲染
-                if (typeof safeContent === 'object' && safeContent.table) {
+                if (typeof safeContent === 'object' && (safeContent as any).table) {
                   // 渲染表格和分析
                   return (
                     <div key={index} className={`flex items-start space-x-3 mb-4`}>
@@ -451,22 +467,22 @@ export const QA: React.FC = () => {
                         <table className="markdown-body">
                           <thead>
                             <tr>
-                              {Object.keys(safeContent.table[0] || {}).map((key) => (
-                                <th key={key}>{key}</th>
+                              {Object.keys((safeContent as any).table[0] || {}).map((key) => (
+                                <th key={key}>{String(key)}</th>
                               ))}
                             </tr>
                           </thead>
                           <tbody>
-                            {safeContent.table.map((row: any, idx: number) => (
+                            {(safeContent as any).table.map((row: any, idx: number) => (
                               <tr key={idx}>
                                 {Object.values(row).map((val, i) => (
-                                  <td key={i}>{val}</td>
+                                  <td key={i}>{String(val)}</td>
                                 ))}
                               </tr>
                             ))}
                           </tbody>
                         </table>
-                        <div style={{ marginTop: 12, color: '#333' }}>{safeContent.analysis}</div>
+                        <div style={{ marginTop: 12, color: '#333' }}>{String((safeContent as any).analysis)}</div>
                         {msg.confidence && (
                           <div className="mt-1 text-xs text-gray-500">
                             置信度：{Math.round(msg.confidence * 100)}%
@@ -580,21 +596,21 @@ export const QA: React.FC = () => {
 
       <div className="bg-white p-6 rounded-lg shadow mt-6">
         <h3 className="text-lg font-medium mb-2">图表预览</h3>
-        {plotlyFigure ? (
+        {state.plotlyFigure ? (
           <>
-            <Plot data={plotlyFigure.data} layout={plotlyFigure.layout} style={{width: '100%', height: '480px'}} config={{responsive: true}} />
+            <Plot data={state.plotlyFigure.data} layout={state.plotlyFigure.layout} style={{width: '100%', height: '480px'}} config={{responsive: true}} />
             <div className="flex gap-2 mt-2">
               <button
                 className="px-3 py-1 bg-blue-500 text-white rounded"
-                onClick={() => window.Plotly && window.Plotly.downloadImage(document.querySelector('.js-plotly-plot'), {format: 'png', filename: 'chart'})}
+                onClick={() => (window as any).Plotly && (window as any).Plotly.downloadImage(document.querySelector('.js-plotly-plot'), {format: 'png', filename: 'chart'})}
               >下载PNG</button>
               <button
                 className="px-3 py-1 bg-green-500 text-white rounded"
-                onClick={() => window.Plotly && window.Plotly.downloadImage(document.querySelector('.js-plotly-plot'), {format: 'svg', filename: 'chart'})}
+                onClick={() => (window as any).Plotly && (window as any).Plotly.downloadImage(document.querySelector('.js-plotly-plot'), {format: 'svg', filename: 'chart'})}
               >下载SVG</button>
               <button
                 className="px-3 py-1 bg-gray-500 text-white rounded"
-                onClick={() => window.Plotly && window.Plotly.downloadImage(document.querySelector('.js-plotly-plot'), {format: 'html', filename: 'chart'})}
+                onClick={() => (window as any).Plotly && (window as any).Plotly.downloadImage(document.querySelector('.js-plotly-plot'), {format: 'html', filename: 'chart'})}
               >下载HTML</button>
             </div>
           </>

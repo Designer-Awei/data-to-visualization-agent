@@ -1,5 +1,4 @@
 import { NextResponse } from 'next/server'
-import { OpenAI } from 'openai'
 import { spawn } from 'child_process'
 import fs from 'fs'
 import path from 'path'
@@ -39,6 +38,39 @@ async function runPlotlyPython(code: string, data: any[]): Promise<any> {
 }
 
 /**
+ * 用fetch直连SiliconFlow LLM API，兼容OpenAI chat.completions.create参数
+ * @param {object} params - 请求参数，需包含model、messages等
+ * @param {number} [maxRetry=2] - 最大重试次数
+ * @returns {Promise<any>} - LLM响应
+ */
+async function callLLMWithRetry(params: any, maxRetry = 2) {
+  let lastError: any = null
+  let tryMessages = params.messages || []
+  for (let i = 0; i <= maxRetry; i++) {
+    try {
+      const res = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.SILICONFLOW_API_KEY}`
+        },
+        body: JSON.stringify({ ...params, messages: tryMessages, stream: false })
+      })
+      if (!res.ok) throw new Error(await res.text())
+      return await res.json()
+    } catch (e: any) {
+      lastError = e
+      if (tryMessages.length > 1) {
+        tryMessages = tryMessages.slice(1)
+      } else {
+        break
+      }
+    }
+  }
+  throw lastError
+}
+
+/**
  * 智能绘图API
  * @param {Request} request - POST请求，包含question, data, columns
  * @returns {Promise<Response>} - plotly_figure及answer
@@ -53,11 +85,7 @@ export async function POST(request: Request) {
 
     // 1. 调用LLM判断是否需要绘图及推荐类型
     const intentPrompt = `你是一个数据可视化助手，请判断用户的问题是否需要生成图表，并给出推荐的plotly图表类型。只返回如下JSON格式：\n{"need_plot": true/false, "plot_type": "bar/line/pie/..."}\n用户问题：${question}\n数据字段：${columns}`
-    const client = new OpenAI({
-      apiKey: process.env.SILICONFLOW_API_KEY,
-      baseURL: 'https://api.siliconflow.cn/v1'
-    })
-    const intentRes = await client.chat.completions.create({
+    const intentRes = await callLLMWithRetry({
       model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
       messages: [
         { role: 'system', content: '你是数据可视化助手，只返回JSON结构。' },
@@ -80,7 +108,7 @@ export async function POST(request: Request) {
 
     // 2. 需要绘图，调用LLM生成plotly代码
     const plotPrompt = `你是数据可视化专家。请根据用户需求和数据，生成plotly的Python代码（只输出代码，不要解释说明）。\n要求：\n- 图表类型为：${plot_type}\n- 变量名必须用fig，必须用plotly.graph_objs（如go.Bar、go.Scatter等）。\n- 数据变量名为data，类型为list[dict]，每个dict的key为字段名。\n- 代码最后必须有：result = fig.to_plotly_json()\n- 只输出完整可运行的Python代码，不要输出markdown、注释或多余内容。\n- 不要使用matplotlib、seaborn等其他库。\n用户问题：${question}\n数据字段：${columns}\n数据示例：${JSON.stringify(preview)}\n`
-    const plotRes = await client.chat.completions.create({
+    const plotRes = await callLLMWithRetry({
       model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
       messages: [
         { role: 'system', content: '你是数据可视化专家，擅长用plotly生成图表。' },

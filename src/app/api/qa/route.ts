@@ -8,17 +8,46 @@ import { OpenAI } from 'openai'
 import { Message } from '@/types/qa'
 
 /**
+ * 用fetch直连SiliconFlow LLM API，兼容OpenAI chat.completions.create参数
+ * @param {object} params - 请求参数，需包含model、messages等
+ * @param {number} [maxRetry=2] - 最大重试次数
+ * @returns {Promise<any>} - LLM响应
+ */
+async function callLLMWithRetry(params: any, maxRetry = 2) {
+  let lastError: any = null
+  let tryMessages = params.messages || []
+  for (let i = 0; i <= maxRetry; i++) {
+    try {
+      const res = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.SILICONFLOW_API_KEY}`
+        },
+        body: JSON.stringify({ ...params, messages: tryMessages, stream: false })
+      })
+      if (!res.ok) throw new Error(await res.text())
+      return await res.json()
+    } catch (e: any) {
+      lastError = e
+      if (tryMessages.length > 1) {
+        tryMessages = tryMessages.slice(1)
+      } else {
+        break
+      }
+    }
+  }
+  throw lastError
+}
+
+/**
  * 意图识别agent：判断用户问题属于问答、绘图还是通用闲聊
  * @param {string} question - 用户输入
  * @returns {Promise<'qa'|'plot'|'general'|null>} - 返回意图类型
  */
 async function detectIntent(question: string): Promise<'qa'|'plot'|'general'|null> {
   const prompt = `你是一个智能助手，请判断用户的问题属于哪一类，只能返回如下JSON：\n- { "intent": "general" }  // 闲聊、问候、无关数据的对话\n- { "intent": "qa" }       // 需要基于数据的分析/计算\n- { "intent": "plot" }     // 需要生成可视化图表\n用户问题：${question}`
-  const client = new OpenAI({
-    apiKey: process.env.SILICONFLOW_API_KEY,
-    baseURL: 'https://api.siliconflow.cn/v1'
-  })
-  const res = await client.chat.completions.create({
+  const res = await callLLMWithRetry({
     model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
     messages: [
       { role: 'system', content: '你是意图识别agent，只返回JSON结构。' },
