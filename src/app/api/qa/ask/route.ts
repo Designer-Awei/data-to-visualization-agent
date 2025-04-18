@@ -114,51 +114,22 @@ export async function POST(request: Request) {
     if (!question || typeof question !== 'string' || !question.trim()) {
       return NextResponse.json({ error: '请输入问题' }, { status: 400 })
     }
-    // 构造系统prompt
-    let systemPrompt = '你是一个数据分析专家，请根据数据和用户问题，给出专业、简明的自然语言答案。如涉及数值计算，请生成一段Python代码（只输出代码，不要解释说明），数据变量名为data，类型为list[dict]，每个dict的key为字段名，代码最后必须有：result = ...（result为最终计算结果）。'
-    if (data && Array.isArray(data) && data.length > 0) {
-      const previewRows = data.slice(0, 10)
-      const dataPreview = JSON.stringify(previewRows, null, 2)
-      systemPrompt += `\n当前数据集包含 ${data.length} 条记录，字段有：${columns || Object.keys(data[0])}\n数据示例：${dataPreview}`
-    }
     // 调用SiliconFlow LLM
     const client = new OpenAI({
       apiKey: process.env.SILICONFLOW_API_KEY,
       baseURL: 'https://api.siliconflow.cn/v1'
     })
-    // 1. LLM辅助字段提取
+    // 字段提取agent：每轮都动态识别本轮涉及字段
     const allFields = columns || (data[0] ? Object.keys(data[0]) : [])
     const userFields = await extractFieldsFromQuestion(client, question, allFields)
-    // 2. 先判断问题类型
-    const qType = await judgeQuestionType(client, question)
-    if (qType === 'analysis') {
-      // 只需分析总结
-      const analysisPrompt = `你是数据分析专家，请根据下方数据和用户问题，直接用中文分析和总结数据亮点，不要生成代码。\n用户问题：${question}\n涉及字段：${userFields.join('、')}\n数据示例：${JSON.stringify(data.slice(0, 10), null, 2)}`
-      const analysisRes = await client.chat.completions.create({
-        model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
-        messages: [
-          { role: 'system', content: '你是一个数据分析专家，善于用中文详细分析数据。' },
-          { role: 'user', content: analysisPrompt }
-        ],
-        temperature: 0.4,
-        max_tokens: 1024,
-        top_p: 0.95,
-        frequency_penalty: 0.3
-      })
-      const answer = analysisRes.choices[0]?.message?.content || '未能分析出有益信息。'
-      return NextResponse.json({ answer })
-    }
-    // 3. 只需计算或需要计算+分析
-    // 构造对话历史，强制LLM只用userFields
-    const conversationMessages = [
-      { role: 'system', content: systemPrompt + `\n请严格只对下列字段进行计算：${userFields.join('、')}，不要遗漏。` },
-      ...messages.slice(-5),
-      { role: 'user', content: question }
-    ]
-    let lastLLMAnswer = ''
-    let lastCode = ''
-    let lastError = ''
-    let retry = 0
+    console.log('[字段提取agent] 用户问题:', question, '可用字段:', allFields, '提取结果:', userFields)
+    // 检索本轮涉及字段的所有数据（前10条）
+    const previewRows = (data || []).map((row: any) => {
+      const filtered: any = {}
+      userFields.forEach(f => filtered[f] = row[f])
+      return filtered
+    }).slice(0, 10)
+    const dataPreview = JSON.stringify(previewRows, null, 2)
     // 自动裁剪messages长度，避免token超限和污染
     const safeMessages = (messages || []).slice(-5)
     // LLM API调用自动重试机制，所有调用都用safeMessages
@@ -180,6 +151,20 @@ export async function POST(request: Request) {
       }
       throw lastError
     }
+    // 动态拼接到system prompt，强制LLM只能输出Python代码块，且最后必须有result=...和print(json.dumps(result, ensure_ascii=False))
+    let systemPrompt = `你是一个数据分析专家。无论用户如何提问，你只能输出Python代码块（用\`\`\`python ... \`\`\`包裹），且代码最后必须有如下格式：\nresult = {\n  "字段1": 值1,\n  "字段2": 值2,\n  ...\n}\nprint(json.dumps(result, ensure_ascii=False))\n不能输出其他print语句或分析文本，否则会被判为错误。`
+    systemPrompt += `\n涉及字段：${userFields.join('、')}`
+    systemPrompt += `\n数据示例：${dataPreview}`
+    // messages只保留对话内容，不再拼接数据
+    const conversationMessages = [
+      { role: 'system', content: systemPrompt },
+      ...safeMessages,
+      { role: 'user', content: question }
+    ]
+    let lastLLMAnswer = ''
+    let lastCode = ''
+    let lastError = ''
+    let retry = 0
     while (retry < 3) {
       const completion = await callLLMWithRetry({
         model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
@@ -189,17 +174,22 @@ export async function POST(request: Request) {
         top_p: 0.9,
         frequency_penalty: 0.5
       })
-      let answer = completion.choices[0]?.message?.content || '抱歉，未能给出答案。'
+      let answer = completion.choices[0]?.message?.content || ''
       lastLLMAnswer = answer
       // 检查是否为Python代码
       const codeMatch = answer.match(/```python([\s\S]*?)```/)
       if (codeMatch) {
-        // 提取代码并执行
         const code = codeMatch[1].trim()
         lastCode = code
-        // 计算agent执行前打印输入数据和代码
-        console.log('[计算agent输入数据]', data)
-        console.log('[计算agent生成代码]', code)
+        // 校验代码是否包含result=和print(json.dumps(result
+        if (!/result\s*=/.test(code) || !/print\s*\(\s*json\.dumps\s*\(\s*result/.test(code)) {
+          retry++
+          conversationMessages.push({
+            role: 'assistant',
+            content: '请严格按要求输出：代码最后必须有result=...和print(json.dumps(result, ensure_ascii=False))，不能输出其他print或分析文本。'
+          })
+          continue
+        }
         try {
           const result = await runPythonCode(code, data)
           console.log('[计算agent执行结果]', result)
@@ -260,13 +250,17 @@ export async function POST(request: Request) {
         } catch (e) {
           lastError = e instanceof Error ? e.message : String(e)
           retry++
-          // 增加一条assistant消息，提示代码执行失败，促使LLM重新生成代码。
-          conversationMessages.push({ role: 'assistant', content: `上次生成的Python代码执行失败，错误信息：${lastError}，请重新生成更正确的代码。` })
+          conversationMessages.push({ role: 'assistant', content: `上次生成的Python代码执行失败，错误信息：${lastError}，请严格按要求输出：代码最后必须有result=...和print(json.dumps(result, ensure_ascii=False))，不能输出其他print或分析文本。` })
           continue
         }
       } else {
-        // 没有代码，直接返回LLM口算结果
-        return NextResponse.json({ answer })
+        // 没有代码，自动补assistant消息，强制LLM重试
+        retry++
+        conversationMessages.push({
+          role: 'assistant',
+          content: '请只输出Python代码块（用```python ... ```包裹），且代码最后必须有result=...和print(json.dumps(result, ensure_ascii=False))，不能输出其他print或分析文本。'
+        })
+        continue
       }
     }
     // 连续三次都失败，返回LLM口算结果并备注
