@@ -457,8 +457,24 @@ export const QA: React.FC = () => {
                 ) {
                   safeContent = '【LLM服务异常】未知错误'
                 }
-                // 结构化渲染
-                if (typeof safeContent === 'object' && (safeContent as any).table) {
+                // 新增：只返回 analysis 时直接渲染 analysis
+                if (typeof safeContent === 'object' && (safeContent as any).analysis) {
+                  return (
+                    <div key={index} className={`flex items-start space-x-3 mb-4`}>
+                      <Avatar icon={<RobotOutlined />} className="bg-green-500" />
+                      <div className="max-w-[70%] bg-white p-3 rounded-lg shadow">
+                        <div className="markdown-body">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{(safeContent as any).analysis}</ReactMarkdown>
+                        </div>
+                        {msg.confidence && (
+                          <div className="mt-1 text-xs text-gray-500">
+                            置信度：{Math.round(msg.confidence * 100)}%
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )
+                } else if (typeof safeContent === 'object' && (safeContent as any).table) {
                   // 渲染表格和分析
                   return (
                     <div key={index} className={`flex items-start space-x-3 mb-4`}>

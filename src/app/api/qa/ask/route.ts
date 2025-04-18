@@ -284,16 +284,9 @@ export async function POST(request: Request) {
           const isDiffWithIntermediate = typeof result === 'number' && Array.isArray(messages) && messages.length > 0 && /平均分|差值|中间结果/.test(question)
           // 结果溯源标记，确保传递给二次组织agent的结果100%来自Python
           const resultSource = 'python'
-          // prompt中声明"下方计算结果为后端Python真实执行所得"
+          // 二次组织agent prompt优化：只保留analysis字段，不再要求table结构
           let explainPrompt = ''
-          if (isSingleField && !isDiffWithIntermediate) {
-            const fieldName = userFields[0] || (typeof result === 'object' ? Object.keys(result)[0] : '')
-            const avg = typeof result === 'number' ? result : (typeof result === 'object' ? Object.values(result)[0] : '')
-            explainPrompt = `你是一名数据分析专家。下方【计算结果】100%为后端Python真实执行所得，请严格以如下JSON格式输出：\n{\n  "table": [\n    {"字段": "${fieldName}", "值": ${Number(avg).toFixed(2)}}\n  ],\n  "analysis": "简明分析文本"\n}\n请直接引用上方字段和值，不能写其他字段名。`;
-          } else {
-            // 自动适配：table每一行的key与【计算结果】中的key一致
-            explainPrompt = `你是一名数据分析专家。下方【计算结果】100%为后端Python真实执行所得，请严格以如下JSON格式输出：\n{\n  "table": [\n    {"字段名": "这里填写真实key", "值": 数值或对象},\n    ...\n  ],\n  "analysis": "简明分析文本"\n}\n所有小数结果默认保留两位小数，顺序与下方【计算结果】JSON一致，table每一行的key必须与【计算结果】中的key完全一致，不得写'字段名'或其他占位符。analysis需引用真实数值。\n【计算结果】：${JSON.stringify(result, null, 2)}\n请严格按照上述要求作答，只能输出JSON对象，不要输出多余内容。`;
-          }
+          explainPrompt = `你是一名数据分析专家。下方【计算结果】100%为后端Python真实执行所得，请严格以如下JSON格式输出：\n{\n  "analysis": "简明分析文本，需引用所有真实数值和关键信息"\n}\n请直接引用下方【计算结果】中的所有关键信息和数值，不能遗漏。\n【计算结果】：${JSON.stringify(result, null, 2)}\n请严格按照上述要求作答，只能输出JSON对象，不要输出多余内容。`;
           console.log('[二次组织agent输入prompt]', explainPrompt)
           const explainCompletion = await callLLMWithRetry({
             model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
@@ -309,14 +302,12 @@ export async function POST(request: Request) {
           const explainAnswer = explainCompletion.choices[0]?.message?.content || ''
           console.log('[二次组织agent LLM输出]', explainAnswer)
           // 解析结构化表格和分析文本
-          let table = []
           let analysis = ''
           try {
             const jsonStr = explainAnswer.replace(/```json|```/g, '').trim()
             const parsed = JSON.parse(jsonStr)
-            table = parsed.table || []
             analysis = parsed.analysis || ''
-            if (!table.length && !analysis) {
+            if (!analysis) {
               throw new Error('LLM输出内容为空或格式不符')
             }
           } catch (e) {
@@ -326,8 +317,8 @@ export async function POST(request: Request) {
           if (typeof result === 'number' && typeof (globalThis as any)._intermediateResults === 'object') {
             resultObj = { ...(globalThis as any)._intermediateResults, 差值: result }
           }
-          // 返回结构中加入source: 'python'
-          return NextResponse.json({ answer: { table, analysis }, code, result: resultObj, source: resultSource })
+          // 返回结构中只保留analysis
+          return NextResponse.json({ answer: { analysis }, code, result: resultObj, source: resultSource })
         } catch (e) {
           lastError = e instanceof Error ? e.message : String(e)
           retry++
