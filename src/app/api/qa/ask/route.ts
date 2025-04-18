@@ -16,9 +16,17 @@ async function runPythonCode(code: string, data: any[]): Promise<any> {
     const tmpCode = path.join(process.cwd(), 'tmp_calc_code.py')
     fs.writeFileSync(tmpData, JSON.stringify(data, null, 2))
     // 拼接完整python脚本
-    const pyCode = `import json\nwith open(r'${tmpData}', 'r', encoding='utf-8') as f:\n    data = json.load(f)\n${code}\nprint(json.dumps(result, ensure_ascii=False))\n`
+    let safeCode = code
+    // 若没有print(json.dumps(result))，则在末尾补一行
+    if (!/print\(json\.dumps\(result/.test(safeCode)) {
+      safeCode += "\nprint(json.dumps(result, ensure_ascii=False))\n"
+    }
+    // 强制Python脚本全程utf-8输出，防止中文key乱码
+    const pyCode = `import sys\nimport io\nsys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')\nsys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')\nimport json\nwith open(r'${tmpData}', 'r', encoding='utf-8') as f:\n    data = json.load(f)\n${safeCode}`
     fs.writeFileSync(tmpCode, pyCode)
     const py = spawn('python', [tmpCode])
+    py.stdout.setEncoding('utf8')
+    py.stderr.setEncoding('utf8')
     let output = ''
     py.stdout.on('data', (d) => { output += d.toString() })
     py.stderr.on('data', (d) => { console.error('Python错误:', d.toString()) })
@@ -151,8 +159,29 @@ export async function POST(request: Request) {
     let lastCode = ''
     let lastError = ''
     let retry = 0
+    // 自动裁剪messages长度，避免token超限和污染
+    const safeMessages = (messages || []).slice(-5)
+    // LLM API调用自动重试机制，所有调用都用safeMessages
+    const callLLMWithRetry = async (params: any, maxRetry = 2) => {
+      let lastError: any = null
+      let tryMessages = params.messages || safeMessages
+      for (let i = 0; i <= maxRetry; i++) {
+        try {
+          return await client.chat.completions.create({ ...params, messages: tryMessages })
+        } catch (e: any) {
+          lastError = e
+          // 只对400/500等API错误重试，每次重试都再裁剪掉最早一条
+          if (e && (e.status === 400 || e.status === 500) && tryMessages.length > 1) {
+            tryMessages = tryMessages.slice(1)
+          } else {
+            break
+          }
+        }
+      }
+      throw lastError
+    }
     while (retry < 3) {
-      const completion = await client.chat.completions.create({
+      const completion = await callLLMWithRetry({
         model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
         messages: conversationMessages,
         temperature: 0.3,
@@ -168,46 +197,70 @@ export async function POST(request: Request) {
         // 提取代码并执行
         const code = codeMatch[1].trim()
         lastCode = code
+        // 计算agent执行前打印输入数据和代码
+        console.log('[计算agent输入数据]', data)
+        console.log('[计算agent生成代码]', code)
         try {
           const result = await runPythonCode(code, data)
-          // 二次LLM解释环节
-          if (qType === 'both') {
-            // 先计算再分析，合并自然语言输出，强制LLM引用真实计算结果
-            const explainPrompt = `你是一名数据分析专家。请根据以下信息，先用简明自然语言解释【指定的计算结果】，再进一步分析数据亮点：\n- 用户问题：${question}\n- 计算代码：\n${code}\n- 涉及字段：${userFields.join('、')}\n- 【计算结果】：${JSON.stringify(result)}\n请务必直接引用【计算结果】中的数值，不要自行推算或更改。先解释思路和结论，再补充数据分析建议。`
-            const explainCompletion = await client.chat.completions.create({
-              model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
-              messages: [
-                { role: 'system', content: '你是一个数据分析专家，善于用中文详细解释数据分析和计算过程。' },
-                { role: 'user', content: explainPrompt }
-              ],
-              temperature: 0.4,
-              max_tokens: 1024,
-              top_p: 0.95,
-              frequency_penalty: 0.3
-            })
-            const explainAnswer = explainCompletion.choices[0]?.message?.content || `计算结果：${JSON.stringify(result)}`
-            return NextResponse.json({ answer: explainAnswer, code, result })
+          console.log('[计算agent执行结果]', result)
+          // 判断是否为单字段且为数值
+          const isSingleField = userFields.length === 1 && (typeof result === 'number' || (typeof result === 'object' && Object.keys(result).length === 1))
+          // 判断是否为单一数值但有中间结果（如差值）
+          const isDiffWithIntermediate = typeof result === 'number' && Array.isArray(messages) && messages.length > 0 && /平均分|差值|中间结果/.test(question)
+          let explainPrompt = ''
+          if (isSingleField && !isDiffWithIntermediate) {
+            // 单字段，直接给出字段名和值，要求LLM照抄
+            const fieldName = userFields[0] || (typeof result === 'object' ? Object.keys(result)[0] : '')
+            const avg = typeof result === 'number' ? result : (typeof result === 'object' ? Object.values(result)[0] : '')
+            explainPrompt = `你是一名数据分析专家。请严格以如下JSON格式输出：\n{\n  \"table\": [\n    {\"科目\": \"${fieldName}\", \"平均分\": ${Number(avg).toFixed(2)}}\n  ],\n  \"analysis\": \"简明分析文本\"\n}\n请直接引用上方科目和平均分，不能写其他字段名。`;
+          } else if (typeof result === 'number') {
+            // 差值/总分等单一数值，需带中间结果
+            explainPrompt = `你是一名数据分析专家。请根据下方【计算结果】智能判断：\n- 如果【计算结果】是单一数值（如差值、总分等），请只输出如下JSON对象：\n  {\n    \"analysis\": \"简明分析文本，需引用所有中间结果和最终数值\"\n  }\n- 如果【计算结果】是对象（如多科目平均分），请输出如下JSON对象：\n  {\n    \"table\": [\n      {\"科目\": \"真实字段名\", \"平均分\": 数值},\n      ...\n    ],\n    \"analysis\": \"简明分析文本\"\n  }\n所有小数结果默认保留两位小数，analysis需引用所有中间结果和最终数值。请严格按照上述要求作答，只能输出JSON对象，不要输出多余内容。\n【计算结果】：${JSON.stringify(result, null, 2)}`;
           } else {
-            // 只需计算
-            const explainPrompt = `你是一名数据分析专家。请根据以下信息，用简明自然语言回答用户问题，并展示详细的计算过程：\n- 用户问题：${question}\n- 计算代码：\n${code}\n- 涉及字段：${userFields.join('、')}\n- 计算结果：${JSON.stringify(result)}\n请先解释思路，再展示计算过程，最后给出结论。`
-            const explainCompletion = await client.chat.completions.create({
-              model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
-              messages: [
-                { role: 'system', content: '你是一个数据分析专家，善于用中文详细解释数据分析和计算过程。' },
-                { role: 'user', content: explainPrompt }
-              ],
-              temperature: 0.4,
-              max_tokens: 1024,
-              top_p: 0.95,
-              frequency_penalty: 0.3
-            })
-            const explainAnswer = explainCompletion.choices[0]?.message?.content || `计算结果：${JSON.stringify(result)}`
-            return NextResponse.json({ answer: explainAnswer, code, result })
+            // 多字段，按原有逻辑
+            explainPrompt = `你是一名数据分析专家。请严格以如下JSON格式输出：\n{\n  \"table\": [\n    {\"科目\": \"这里填写真实字段名\", \"平均分\": 数值},\n    ...\n  ],\n  \"analysis\": \"简明分析文本\"\n}\n所有小数结果默认保留两位小数，顺序与下方【计算结果】JSON一致，科目字段必须与【计算结果】中的key完全一致，不得写'字段名'或其他占位符。analysis需引用真实数值。\n【计算结果】：${JSON.stringify(result, null, 2)}\n请严格按照上述要求作答，只能输出JSON对象，不要输出多余内容。`;
           }
+          console.log('[二次组织agent输入prompt]', explainPrompt)
+          const explainCompletion = await callLLMWithRetry({
+            model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
+            messages: [
+              { role: 'system', content: '你是一个数据分析专家，只能输出严格结构化JSON对象。' },
+              { role: 'user', content: explainPrompt }
+            ],
+            temperature: 0.3,
+            max_tokens: 1024,
+            top_p: 0.95,
+            frequency_penalty: 0.3
+          })
+          const explainAnswer = explainCompletion.choices[0]?.message?.content || ''
+          console.log('[二次组织agent LLM输出]', explainAnswer)
+          // 解析结构化表格和分析文本
+          let table = []
+          let analysis = ''
+          try {
+            const jsonStr = explainAnswer.replace(/```json|```/g, '').trim()
+            const parsed = JSON.parse(jsonStr)
+            table = parsed.table || []
+            analysis = parsed.analysis || ''
+            // 若无table和analysis，强制输出错误提示
+            if (!table.length && !analysis) {
+              throw new Error('LLM输出内容为空或格式不符')
+            }
+          } catch (e) {
+            // fallback: 兼容旧格式或异常，始终返回标准JSON
+            analysis = `【LLM服务异常】输出内容解析失败：${e instanceof Error ? e.message : String(e)}，原始内容：${explainAnswer}`
+          }
+          // 计算agent执行后，自动组装中间结果和最终结果
+          let resultObj = result
+          if (typeof result === 'number' && typeof (globalThis as any)._intermediateResults === 'object') {
+            // 若有全局中间结果，合并
+            resultObj = { ...(globalThis as any)._intermediateResults, 差值: result }
+          }
+          return NextResponse.json({ answer: { table, analysis }, code, result: resultObj })
         } catch (e) {
           lastError = e instanceof Error ? e.message : String(e)
           retry++
-          // 增加一条assistant消息，提示代码执行失败，促使LLM重新生成代码
+          // 增加一条assistant消息，提示代码执行失败，促使LLM重新生成代码。
           conversationMessages.push({ role: 'assistant', content: `上次生成的Python代码执行失败，错误信息：${lastError}，请重新生成更正确的代码。` })
           continue
         }
@@ -220,6 +273,15 @@ export async function POST(request: Request) {
     return NextResponse.json({ answer: lastLLMAnswer + '\n【警告：自动代码执行连续失败，已返回LLM口算结果，可能不准确】', code: lastCode, error: lastError })
   } catch (error) {
     console.error('智能问答API/计算agent错误:', error)
-    return NextResponse.json({ error: '处理问答请求时发生错误' }, { status: 500 })
+    // 兜底：无论如何都返回标准JSON
+    let errMsg = '处理问答请求时发生错误';
+    if (error instanceof Error) {
+      errMsg = error.message || errMsg;
+    } else if (typeof error === 'string') {
+      errMsg = error;
+    }
+    // 若异常内容为空，也要兜底
+    if (!errMsg) errMsg = 'LLM API返回空响应';
+    return NextResponse.json({ error: errMsg }, { status: 500 })
   }
 } 

@@ -8,12 +8,12 @@ import { OpenAI } from 'openai'
 import { Message } from '@/types/qa'
 
 /**
- * 意图识别agent：判断用户问题属于问答还是绘图
+ * 意图识别agent：判断用户问题属于问答、绘图还是通用闲聊
  * @param {string} question - 用户输入
- * @returns {Promise<'qa'|'plot'|null>} - 返回意图类型
+ * @returns {Promise<'qa'|'plot'|'general'|null>} - 返回意图类型
  */
-async function detectIntent(question: string): Promise<'qa'|'plot'|null> {
-  const prompt = `你是一个智能助手，请判断用户的问题属于哪一类，只能返回如下JSON：{ "intent": "qa" } 或 { "intent": "plot" }。\n- "qa"表示普通问答（如数据分析、解释、总结等）\n- "plot"表示需要生成可视化图表（如画图、可视化、趋势、分布等）\n用户问题：${question}`
+async function detectIntent(question: string): Promise<'qa'|'plot'|'general'|null> {
+  const prompt = `你是一个智能助手，请判断用户的问题属于哪一类，只能返回如下JSON：\n- { "intent": "general" }  // 闲聊、问候、无关数据的对话\n- { "intent": "qa" }       // 需要基于数据的分析/计算\n- { "intent": "plot" }     // 需要生成可视化图表\n用户问题：${question}`
   const client = new OpenAI({
     apiKey: process.env.SILICONFLOW_API_KEY,
     baseURL: 'https://api.siliconflow.cn/v1'
@@ -33,7 +33,7 @@ async function detectIntent(question: string): Promise<'qa'|'plot'|null> {
     // eslint-disable-next-line
     const { intent } = JSON.parse(intentJson)
     console.log(`[意图识别agent] 用户问题: ${question} => 识别为: ${intent}`)
-    if (intent === 'qa' || intent === 'plot') return intent
+    if (intent === 'qa' || intent === 'plot' || intent === 'general') return intent
     return null
   } catch {
     console.log(`[意图识别agent] 解析失败: ${intentJson}`)
@@ -74,6 +74,23 @@ export async function POST(request: Request) {
       })
       const result = await resp.json()
       return NextResponse.json(result)
+    } else if (intent === 'general') {
+      // 通用闲聊，直接LLM自然回复
+      const client = new OpenAI({
+        apiKey: process.env.SILICONFLOW_API_KEY,
+        baseURL: 'https://api.siliconflow.cn/v1'
+      })
+      const chatRes = await client.chat.completions.create({
+        model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
+        messages: [
+          { role: 'system', content: '你是一个友好、专业的AI助手，请用简洁自然的中文回复用户问题。' },
+          { role: 'user', content: question }
+        ],
+        temperature: 0.5,
+        max_tokens: 1024
+      })
+      const answer = chatRes.choices[0]?.message?.content || '很高兴为你服务！'
+      return NextResponse.json({ answer })
     } else {
       return NextResponse.json({ answer: '未能识别你的问题意图，请重试或换种表达。', plotly_figure: null })
     }

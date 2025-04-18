@@ -5,8 +5,8 @@
 'use client'
 
 import React, { useState, useRef, useEffect } from 'react'
-import { Input, Button, Card, Spin, Alert, Typography, Select, Upload, Avatar } from 'antd'
-import { SendOutlined, InboxOutlined, UserOutlined, RobotOutlined } from '@ant-design/icons'
+import { Input, Button, Card, Spin, Alert, Typography, Select, Upload, Avatar, Modal } from 'antd'
+import { SendOutlined, InboxOutlined, UserOutlined, RobotOutlined, SettingOutlined } from '@ant-design/icons'
 import { QAState, QAResponse, DataState, Message } from '@/types/qa'
 import type { UploadProps } from 'antd'
 import { message } from 'antd'
@@ -85,6 +85,55 @@ export const QA: React.FC = () => {
   const [abortController, setAbortController] = useState<AbortController | null>(null) // 控制fetch中断
   const [isAborting, setIsAborting] = useState(false) // 是否正在打断
   const [plotlyFigure, setPlotlyFigure] = useState<any>(null)
+  const [showKeyModal, setShowKeyModal] = useState(false)
+  const [apiKeyInput, setApiKeyInput] = useState('')
+  const [apiKeyStatus, setApiKeyStatus] = useState<'idle'|'validating'|'success'|'error'>('idle')
+  const [apiKeyMsg, setApiKeyMsg] = useState('')
+
+  // 检查本地env.local密钥（通过window.__ENV__或process.env注入，实际部署时可用）
+  const hasEnvApiKey = !!process.env.SILICONFLOW_API_KEY || (typeof window !== 'undefined' && (window as any).__ENV__?.SILICONFLOW_API_KEY)
+
+  // 保存API密钥到localStorage
+  const saveApiKey = () => {
+    if (!apiKeyInput.trim()) {
+      setApiKeyStatus('error')
+      setApiKeyMsg('请输入API密钥')
+      return
+    }
+    localStorage.setItem('SILICONFLOW_API_KEY', apiKeyInput.trim())
+    setApiKeyStatus('success')
+    setApiKeyMsg('密钥已保存！')
+  }
+
+  // 验证API密钥有效性
+  const validateApiKey = async () => {
+    setApiKeyStatus('validating')
+    setApiKeyMsg('正在验证...')
+    try {
+      // 用密钥请求一次SiliconFlow LLM接口
+      const resp = await fetch('https://api.siliconflow.cn/v1/models', {
+        headers: { 'Authorization': `Bearer ${apiKeyInput.trim()}` }
+      })
+      if (resp.ok) {
+        setApiKeyStatus('success')
+        setApiKeyMsg('密钥有效！')
+      } else {
+        setApiKeyStatus('error')
+        setApiKeyMsg('密钥无效或无权限')
+      }
+    } catch {
+      setApiKeyStatus('error')
+      setApiKeyMsg('网络异常，验证失败')
+    }
+  }
+
+  // 读取localStorage密钥（仅在无env密钥时生效）
+  useEffect(() => {
+    if (!hasEnvApiKey) {
+      const localKey = typeof window !== 'undefined' ? localStorage.getItem('SILICONFLOW_API_KEY') : ''
+      if (localKey) setApiKeyInput(localKey)
+    }
+  }, [hasEnvApiKey])
 
   /**
    * 处理问题输入变化
@@ -161,12 +210,16 @@ export const QA: React.FC = () => {
     if (!state.question.trim() || state.isLoading) return
     setInputDisabled(true)
     setIsAborting(false)
+    // 过滤掉所有"【LLM服务异常】"开头的历史消息，避免污染对话记忆
+    const filteredMessages = state.messages.filter(
+      m => !(typeof m.content === 'string' && m.content.startsWith('【LLM服务异常】'))
+    )
     setState(prev => ({
       ...prev,
       isLoading: true,
       error: null,
       question: '',
-      messages: [...prev.messages, { role: 'user', content: prev.question }]
+      messages: [...filteredMessages, { role: 'user', content: prev.question }]
     }))
     const controller = new AbortController()
     setAbortController(controller)
@@ -178,13 +231,36 @@ export const QA: React.FC = () => {
           question: state.question,
           model: state.model,
           data: state.data?.rows,
-          messages: state.messages
+          messages: filteredMessages
         }),
         signal: controller.signal
       })
       if (!response.ok) {
-        const errorData = await response.json()
-        throw new Error(errorData.error || '请求失败')
+        let errorMsg = `请求失败，状态码${response.status}`
+        let errorContent = ''
+        try {
+          const errorData = await response.json()
+          errorMsg = errorData.error || errorMsg
+          errorContent = `【LLM服务异常】${errorMsg}`
+        } catch {
+          errorContent = `【LLM服务异常】LLM API请求失败，状态码${response.status}`
+        }
+        setState(prev => ({
+          ...prev,
+          isLoading: false,
+          error: errorMsg,
+          messages: [
+            ...prev.messages,
+            {
+              role: 'assistant',
+              content: errorContent || '【LLM服务异常】未知错误',
+              confidence: undefined
+            }
+          ]
+        }))
+        setInputDisabled(false)
+        setAbortController(null)
+        return
       }
       const data: QAResponse = await response.json()
       const aiMessage: Message = {
@@ -202,11 +278,20 @@ export const QA: React.FC = () => {
       setAbortController(null)
       if (data.plotly_figure) setPlotlyFigure(data.plotly_figure)
     } catch (error: any) {
-      if (error.name === 'AbortError') {
-        setState(prev => ({ ...prev, isLoading: false, error: '回复已被打断' }))
-      } else {
-        setState(prev => ({ ...prev, error: error.message || '发生错误，请稍后重试', isLoading: false }))
-      }
+      let errMsg = error?.message || '发生错误，请稍后重试'
+      setState(prev => ({
+        ...prev,
+        error: errMsg,
+        isLoading: false,
+        messages: [
+          ...prev.messages,
+          {
+            role: 'assistant',
+            content: `【LLM服务异常】${errMsg || '未知错误'}`,
+            confidence: undefined
+          }
+        ]
+      }))
       setInputDisabled(false)
       setAbortController(null)
       setIsAborting(false)
@@ -233,6 +318,32 @@ export const QA: React.FC = () => {
 
   return (
     <div className="space-y-6">
+      {/* 右上角齿轮设置按钮 */}
+      <div style={{ position: 'absolute', top: 24, right: 32, zIndex: 20 }}>
+        <Button shape="circle" icon={<SettingOutlined />} onClick={() => setShowKeyModal(true)} />
+      </div>
+      {/* API密钥设置弹窗 */}
+      <Modal
+        title="SiliconFlow API密钥设置"
+        open={showKeyModal}
+        onCancel={() => setShowKeyModal(false)}
+        footer={null}
+      >
+        <div style={{ marginBottom: 12 }}>
+          <Input.Password
+            placeholder="请输入SiliconFlow API密钥"
+            value={apiKeyInput}
+            onChange={e => setApiKeyInput(e.target.value)}
+            disabled={hasEnvApiKey}
+          />
+        </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <Button type="primary" onClick={saveApiKey} disabled={hasEnvApiKey}>保存到本地</Button>
+          <Button onClick={validateApiKey} disabled={hasEnvApiKey || !apiKeyInput.trim()}>验证密钥</Button>
+        </div>
+        <div style={{ marginTop: 8, color: apiKeyStatus === 'error' ? 'red' : apiKeyStatus === 'success' ? 'green' : '#888' }}>{apiKeyMsg}</div>
+        {hasEnvApiKey && <div style={{ marginTop: 12, color: '#888' }}>当前已通过服务器环境变量配置密钥，前端本地密钥仅在无env.local时生效。</div>}
+      </Modal>
       {/* 文件上传区域 */}
       <div className="bg-white p-6 rounded-lg shadow-sm">
         <h3 className="text-lg font-medium mb-4">上传数据</h3>
@@ -320,45 +431,90 @@ export const QA: React.FC = () => {
           <div className="bg-gray-50 rounded-lg p-4 h-96 overflow-y-auto">
             {state.messages.map((msg, index) => {
               if (msg.role === 'assistant') {
-                const segments = splitMarkdownSegments(msg.content);
-                return (
-                  <div key={index} className={`flex items-start space-x-3 mb-4`}>
-                    <Avatar icon={<RobotOutlined />} className="bg-green-500" />
-                    <div className="max-w-[70%] bg-white p-3 rounded-lg shadow">
-                      {/* 按顺序渲染正文和代码块 */}
-                      {segments.map((seg, i) =>
-                        seg.type === 'text' ? (
-                          seg.content.trim() ? (
-                            <div className="markdown-body mb-2" key={i}>
-                              <ReactMarkdown remarkPlugins={[remarkGfm]}>{seg.content.replace(/\n{3,}/g, '\n\n')}</ReactMarkdown>
-                            </div>
-                          ) : null
-                        ) : (
-                          <div className="qa-code-block-container mb-2" key={i} style={{position: 'relative', background: '#f6f8fa', borderRadius: 6, border: '1px solid #eaeaea', overflow: 'auto'}}>
-                            <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '2px 8px', background: '#f3f3f3', borderTopLeftRadius: 6, borderTopRightRadius: 6, borderBottom: '1px solid #eaeaea'}}>
-                              <span style={{fontSize: 12, color: '#888'}}>{seg.lang || 'code'}</span>
-                              <button
-                                style={{fontSize: 12, color: '#007bff', background: 'none', border: 'none', cursor: 'pointer'}}
-                                onClick={() => {
-                                  navigator.clipboard.writeText(seg.code)
-                                  message.success('代码已复制')
-                                }}
-                              >复制</button>
-                            </div>
-                            <pre style={{margin: 0, padding: 12, background: 'none', overflowX: 'auto', overflowY: 'auto', maxHeight: 'calc(1.6em * 8 + 24px)', fontSize: '95%', borderRadius: 4}}>
-                              <code className={`language-${seg.lang}`}>{seg.code}</code>
-                            </pre>
+                // 兜底：content为空、null、空对象、空字符串时强制显示错误
+                let safeContent = msg.content
+                if (
+                  safeContent === undefined ||
+                  safeContent === null ||
+                  (typeof safeContent === 'string' && !safeContent.trim()) ||
+                  (typeof safeContent === 'object' && (!safeContent || Object.keys(safeContent).length === 0))
+                ) {
+                  safeContent = '【LLM服务异常】未知错误'
+                }
+                // 结构化渲染
+                if (typeof safeContent === 'object' && safeContent.table) {
+                  // 渲染表格和分析
+                  return (
+                    <div key={index} className={`flex items-start space-x-3 mb-4`}>
+                      <Avatar icon={<RobotOutlined />} className="bg-green-500" />
+                      <div className="max-w-[70%] bg-white p-3 rounded-lg shadow">
+                        <table className="markdown-body">
+                          <thead>
+                            <tr>
+                              {Object.keys(safeContent.table[0] || {}).map((key) => (
+                                <th key={key}>{key}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {safeContent.table.map((row: any, idx: number) => (
+                              <tr key={idx}>
+                                {Object.values(row).map((val, i) => (
+                                  <td key={i}>{val}</td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                        <div style={{ marginTop: 12, color: '#333' }}>{safeContent.analysis}</div>
+                        {msg.confidence && (
+                          <div className="mt-1 text-xs text-gray-500">
+                            置信度：{Math.round(msg.confidence * 100)}%
                           </div>
-                        )
-                      )}
-                      {msg.confidence && (
-                        <div className="mt-1 text-xs text-gray-500">
-                          置信度：{Math.round(msg.confidence * 100)}%
-                        </div>
-                      )}
+                        )}
+                      </div>
                     </div>
-                  </div>
-                )
+                  )
+                } else {
+                  // Markdown渲染
+                  const segments = splitMarkdownSegments(typeof safeContent === 'string' ? safeContent : '')
+                  return (
+                    <div key={index} className={`flex items-start space-x-3 mb-4`}>
+                      <Avatar icon={<RobotOutlined />} className="bg-green-500" />
+                      <div className="max-w-[70%] bg-white p-3 rounded-lg shadow">
+                        {segments.map((seg, i) =>
+                          seg.type === 'text' ? (
+                            seg.content.trim() ? (
+                              <div className="markdown-body mb-2" key={i}>
+                                <ReactMarkdown remarkPlugins={[remarkGfm]}>{seg.content.replace(/\n{3,}/g, '\n\n')}</ReactMarkdown>
+                              </div>
+                            ) : null
+                          ) :
+                            <div className="qa-code-block-container mb-2" key={i} style={{position: 'relative', background: '#f6f8fa', borderRadius: 6, border: '1px solid #eaeaea', overflow: 'auto'}}>
+                              <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '2px 8px', background: '#f3f3f3', borderTopLeftRadius: 6, borderTopRightRadius: 6, borderBottom: '1px solid #eaeaea'}}>
+                                <span style={{fontSize: 12, color: '#888'}}>{seg.lang || 'code'}</span>
+                                <button
+                                  style={{fontSize: 12, color: '#007bff', background: 'none', border: 'none', cursor: 'pointer'}}
+                                  onClick={() => {
+                                    navigator.clipboard.writeText(seg.code)
+                                    message.success('代码已复制')
+                                  }}
+                                >复制</button>
+                              </div>
+                              <pre style={{margin: 0, padding: 12, background: 'none', overflowX: 'auto', overflowY: 'auto', maxHeight: 'calc(1.6em * 8 + 24px)', fontSize: '95%', borderRadius: 4}}>
+                                <code className={`language-${seg.lang}`}>{seg.code}</code>
+                              </pre>
+                            </div>
+                        )}
+                        {msg.confidence && (
+                          <div className="mt-1 text-xs text-gray-500">
+                            置信度：{Math.round(msg.confidence * 100)}%
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )
+                }
               }
               // 恢复user和system消息渲染
               return (
