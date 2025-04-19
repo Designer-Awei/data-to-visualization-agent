@@ -1,10 +1,12 @@
 /**
  * 数据清洗组件
  * 提供数据清洗功能,包括缺失值处理、异常值检测等
+ * 清洗完成后会在前端弹窗提示"数据清洗已完成"
  */
 'use client'
 
 import { useState } from 'react'
+import { message } from 'antd'
 
 interface DataCleaningProps {
   data?: any[]
@@ -37,6 +39,12 @@ export function DataCleaning({ data = [], onDataCleaned }: DataCleaningProps) {
 
       const cleanedData = await response.json()
       onDataCleaned?.(cleanedData)
+      // 清洗完成提示
+      if (typeof message !== 'undefined' && message.success) {
+        message.success('数据清洗已完成！')
+      } else {
+        window.alert('数据清洗已完成！')
+      }
     } catch (error) {
       console.error('数据清洗错误:', error)
     }
