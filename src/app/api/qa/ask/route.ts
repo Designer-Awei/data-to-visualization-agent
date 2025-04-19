@@ -82,6 +82,23 @@ async function judgeQuestionType(question: string): Promise<'calc'|'analysis'|'b
 }
 
 /**
+ * 相关性字段筛选函数：用于字段提取agent兜底
+ * @param {string[]} allFields
+ * @param {any[]} dataRows
+ * @param {string} question
+ * @returns {string[]}
+ */
+function getRelevantNumericFields(allFields: string[], dataRows: any[], question: string): string[] {
+  const sample = dataRows && dataRows.length > 0 ? dataRows[0] : {};
+  const numericFields = Object.keys(sample).filter(k => typeof sample[k] === 'number');
+  const keywords = ['分', '价', '金额', 'score', 'price', 'amount', 'total', 'sum'];
+  return numericFields.filter(f =>
+    keywords.some(kw => f.toLowerCase().includes(kw)) ||
+    question.includes(f)
+  );
+}
+
+/**
  * 用LLM辅助从用户问题中提取字段名
  * @param {string} question
  * @param {string[]} allFields
@@ -168,6 +185,17 @@ async function callLLMWithRetry(params: any, maxRetry = 2) {
 }
 
 /**
+ * 生成通用型system prompt，适用于各类表格业务场景
+ * @param {string[]} userFields 相关字段（由字段提取agent/兜底机制返回）
+ * @param {any[]} dataPreview 数据预览（前几条样本）
+ * @param {string} question 用户问题
+ * @returns {string}
+ */
+function buildUniversalSystemPrompt(userFields: string[], dataPreview: any[], question: string): string {
+  return `你是一个数据分析专家。无论用户如何提问，你只能输出Python代码块（用\u0060\u0060\u0060python ... \u0060\u0060\u0060包裹），且代码最后必须有如下格式：\nresult = {\n  "字段1": 值1,\n  "字段2": 值2,\n  ...\n}\nprint(json.dumps(result, ensure_ascii=False))\n不能输出其他print语句或分析文本，否则会被判为错误。\n你只能直接使用变量 data（类型为 list[dict]，每个 dict 的 key 为字段名），禁止使用 pd.read_excel、open、os、path 等任何本地文件读取操作，不能写 data = pd.read_excel(...)、data = open(...) 等语句。\n【重要约束】：\n- 你只能对如下"相关字段"进行加和、平均、聚合等数值计算，不能加其他字段（如ID、序号、姓名等非数值字段）：\n  ${userFields.join('、')}\n- 不能用 row.values()、student.values()、dict.values() 等方式直接加所有字段，只能用 for f in fields 方式逐字段取值。\n- 相关字段的名称可能为中文、英文、拼音或缩写，请严格按给定字段名处理。\n数据示例（仅供参考）：\n${JSON.stringify(dataPreview, null, 2)}\n用户问题：${question}`
+}
+
+/**
  * 智能问答API，支持LLM问题类型判断，自动分流计算/分析/混合
  * @param {Request} request - POST请求，包含question, data, columns, messages
  * @returns {Promise<Response>} - LLM回答或计算结果
@@ -180,21 +208,27 @@ export async function POST(request: Request) {
     }
     // 字段提取agent：每轮都动态识别本轮涉及字段
     const allFields = columns || (data[0] ? Object.keys(data[0]) : [])
-    const userFields = await extractFieldsFromQuestion(question, allFields, data)
+    let userFields = await extractFieldsFromQuestion(question, allFields, data)
+    if (!userFields || userFields.length === 0) {
+      userFields = getRelevantNumericFields(allFields, data, question)
+    }
+    if (!userFields || userFields.length === 0) {
+      userFields = Object.keys(data[0] || {}).filter(k => typeof (data[0] || {})[k] === 'number')
+    }
+    // 进一步过滤，排除常见无关字段
+    const excludeKeywords = ['id', '序号', '编号', 'name', '姓名', '学号']
+    userFields = userFields.filter(f => !excludeKeywords.some(kw => f.toLowerCase().includes(kw)))
+    // 生成数据预览
+    const dataPreview = data.slice(0, 8).map((row: any) => {
+      const obj: any = {}
+      userFields.forEach(f => obj[f] = row[f])
+      return obj
+    })
+    // 拼接通用型system prompt
+    const systemPrompt = buildUniversalSystemPrompt(userFields, dataPreview, question)
     console.log('[字段提取agent] 用户问题:', question, '可用字段:', allFields, '提取结果:', userFields)
-    // 检索本轮涉及字段的所有数据（前10条）
-    const previewRows = (data || []).map((row: any) => {
-      const filtered: any = {}
-      userFields.forEach(f => filtered[f] = row[f])
-      return filtered
-    }).slice(0, 10)
-    const dataPreview = JSON.stringify(previewRows, null, 2)
     // 自动裁剪messages长度，避免token超限和污染
     const safeMessages = (messages || []).slice(-5)
-    // 动态拼接到system prompt，强制LLM只能输出Python代码块，且代码最后必须有result=...和print(json.dumps(result, ensure_ascii=False))
-    let systemPrompt = `你是一个数据分析专家。无论用户如何提问，你只能输出Python代码块（用\`\`\`python ... \`\`\`包裹），且代码最后必须有如下格式：\nresult = {\n  \"字段1\": 值1,\n  \"字段2\": 值2,\n  ...\n}\nprint(json.dumps(result, ensure_ascii=False))\n不能输出其他print语句或分析文本，否则会被判为错误。\n你只能直接使用变量 data（类型为 list[dict]，每个 dict 的 key 为字段名），禁止使用 pd.read_excel、open、os、path 等任何本地文件读取操作，不能写 data = pd.read_excel(...)、data = open(...) 等语句。`
-    systemPrompt += `\n涉及字段：${userFields.join('、')}`
-    systemPrompt += `\n数据示例：${dataPreview}`
     // messages只保留对话内容，不再拼接数据
     const conversationMessages = [
       { role: 'system', content: systemPrompt },
