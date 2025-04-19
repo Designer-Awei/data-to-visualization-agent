@@ -159,6 +159,11 @@ async function extractFieldsFromQuestion(question: string, allFields: string[], 
 async function callLLMWithRetry(params: any, maxRetry = 2) {
   let lastError: any = null
   let tryMessages = params.messages || []
+  const model = params.model || process.env.DEFAULT_MODEL
+  if (!model) {
+    return NextResponse.json({ error: '未指定模型' }, { status: 400 })
+  }
+  console.log('[LLM调用] 当前模型:', model)
   for (let i = 0; i <= maxRetry; i++) {
     try {
       const res = await fetch('https://api.siliconflow.cn/v1/chat/completions', {
@@ -202,7 +207,13 @@ function buildUniversalSystemPrompt(userFields: string[], dataPreview: any[], qu
  */
 export async function POST(request: Request) {
   try {
-    const { question, data, columns, messages = [] } = await request.json()
+    const params = await request.json()
+    const model = params.model || process.env.DEFAULT_MODEL
+    if (!model) {
+      return NextResponse.json({ error: '未指定模型' }, { status: 400 })
+    }
+    console.log('[LLM调用] 当前模型:', model)
+    const { question, data, columns, messages = [] } = params
     if (!question || typeof question !== 'string' || !question.trim()) {
       return NextResponse.json({ error: '请输入问题' }, { status: 400 })
     }
@@ -282,7 +293,7 @@ export async function POST(request: Request) {
       // 打印实际传递给LLM的prompt内容，便于排查
       console.log('[LLM请求messages]', messagesStr)
       const completion = await callLLMWithRetry({
-        model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
+        model,
         messages: filteredMessages,
         temperature: 0.3,
         max_tokens: 1024,
@@ -323,7 +334,7 @@ export async function POST(request: Request) {
           explainPrompt = `你是一名数据分析专家。下方【计算结果】100%为后端Python真实执行所得，请严格以如下JSON格式输出：\n{\n  "analysis": "简明分析文本，需引用所有真实数值和关键信息"\n}\n请直接引用下方【计算结果】中的所有关键信息和数值，不能遗漏。\n【计算结果】：${JSON.stringify(result, null, 2)}\n请严格按照上述要求作答，只能输出JSON对象，不要输出多余内容。`;
           console.log('[二次组织agent输入prompt]', explainPrompt)
           const explainCompletion = await callLLMWithRetry({
-            model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
+            model,
             messages: [
               { role: 'system', content: '你是一个数据分析专家，只能输出严格结构化JSON对象。' },
               { role: 'user', content: explainPrompt }
