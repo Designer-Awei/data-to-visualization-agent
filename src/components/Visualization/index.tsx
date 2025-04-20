@@ -18,35 +18,51 @@ export function Visualization({ data = [], columns = [] }: VisualizationProps) {
     yAxis: '',
     title: ''
   })
+  const [errorMsg, setErrorMsg] = useState<string | null>(null)
 
   const handleGenerateChart = async () => {
+    setErrorMsg(null)
     try {
-      const response = await fetch('/api/visualization/generate', {
+      const response = await fetch('/api/visualization/create', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
           data,
-          config: chartConfig
+          columns,
+          // 其他参数
         })
       })
 
+      let errorContent = ''
       if (!response.ok) {
-        throw new Error('图表生成失败')
+        try {
+          const errorData = await response.json()
+          errorContent = errorData.error || '图表生成失败'
+          if (errorData.detail) errorContent += `：${errorData.detail}`
+        } catch {
+          errorContent = '【LLM服务异常】图表API请求失败'
+        }
+        setErrorMsg(errorContent)
+        return
       }
 
-      // 处理返回的图表数据
       const chartData = await response.json()
       // TODO: 使用图表库渲染图表
     } catch (error) {
-      console.error('图表生成错误:', error)
+      setErrorMsg(`【LLM服务异常】${error instanceof Error ? error.message : String(error)}`)
     }
   }
 
   return (
     <div className="space-y-6 bg-white p-6 rounded-lg shadow">
       <h2 className="text-xl font-semibold">数据可视化</h2>
+
+      {/* 错误提示区域 */}
+      {errorMsg && (
+        <div className="text-red-500 mb-2">{errorMsg}</div>
+      )}
 
       <div className="space-y-4">
         {/* 图表类型选择 */}

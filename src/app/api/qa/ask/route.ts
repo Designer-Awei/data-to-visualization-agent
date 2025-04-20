@@ -59,7 +59,7 @@ async function judgeQuestionType(question: string): Promise<'calc'|'analysis'|'b
       'Authorization': `Bearer ${process.env.SILICONFLOW_API_KEY}`
     },
     body: JSON.stringify({
-      model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
+      model: getCurrentModel(),
       messages: [
         { role: 'system', content: '你是问题类型判断agent，只返回JSON结构。' },
         { role: 'user', content: prompt }
@@ -115,7 +115,7 @@ async function extractFieldsFromQuestion(question: string, allFields: string[], 
       'Authorization': `Bearer ${process.env.SILICONFLOW_API_KEY}`
     },
     body: JSON.stringify({
-      model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
+      model: getCurrentModel(),
       messages: [
         { role: 'system', content: '你是字段提取agent，只返回JSON数组。' },
         { role: 'user', content: prompt }
@@ -159,7 +159,7 @@ async function extractFieldsFromQuestion(question: string, allFields: string[], 
 async function callLLMWithRetry(params: any, maxRetry = 2) {
   let lastError: any = null
   let tryMessages = params.messages || []
-  const model = params.model || process.env.DEFAULT_MODEL
+  const model = getCurrentModel()
   if (!model) {
     return NextResponse.json({ error: '未指定模型' }, { status: 400 })
   }
@@ -201,6 +201,14 @@ function buildUniversalSystemPrompt(userFields: string[], dataPreview: any[], qu
 }
 
 /**
+ * 获取当前全局LLM模型名，优先用globalThis.currentLLMModel，没有则用.env默认
+ * @returns {string}
+ */
+function getCurrentModel() {
+  return (globalThis as any).currentLLMModel || process.env.DEFAULT_MODEL
+}
+
+/**
  * 智能问答API，支持LLM问题类型判断，自动分流计算/分析/混合
  * @param {Request} request - POST请求，包含question, data, columns, messages
  * @returns {Promise<Response>} - LLM回答或计算结果
@@ -208,7 +216,7 @@ function buildUniversalSystemPrompt(userFields: string[], dataPreview: any[], qu
 export async function POST(request: Request) {
   try {
     const params = await request.json()
-    const model = params.model || process.env.DEFAULT_MODEL
+    const model = getCurrentModel()
     if (!model) {
       return NextResponse.json({ error: '未指定模型' }, { status: 400 })
     }
@@ -258,8 +266,6 @@ export async function POST(request: Request) {
     if (messagesStr.length > 8000) {
       throw new Error(`LLM请求参数过大：messages总长度${messagesStr.length}，请减少字段或样本数量`)
     }
-    // 打印实际传递给LLM的prompt内容，便于排查
-    console.log('[LLM请求messages]', messagesStr)
     /**
      * 防御性过滤：只保留content为非空字符串的message，避免空content导致参数无效
      */
@@ -290,10 +296,8 @@ export async function POST(request: Request) {
       if (messagesStr.length > 8000) {
         throw new Error(`LLM请求参数过大：messages总长度${messagesStr.length}，请减少字段或样本数量`)
       }
-      // 打印实际传递给LLM的prompt内容，便于排查
-      console.log('[LLM请求messages]', messagesStr)
       const completion = await callLLMWithRetry({
-        model,
+        model: getCurrentModel(),
         messages: filteredMessages,
         temperature: 0.3,
         max_tokens: 1024,
@@ -334,7 +338,7 @@ export async function POST(request: Request) {
           explainPrompt = `你是一名数据分析专家。下方【计算结果】100%为后端Python真实执行所得，请严格以如下JSON格式输出：\n{\n  "analysis": "简明分析文本，需引用所有真实数值和关键信息"\n}\n请直接引用下方【计算结果】中的所有关键信息和数值，不能遗漏。\n【计算结果】：${JSON.stringify(result, null, 2)}\n请严格按照上述要求作答，只能输出JSON对象，不要输出多余内容。`;
           console.log('[二次组织agent输入prompt]', explainPrompt)
           const explainCompletion = await callLLMWithRetry({
-            model,
+            model: getCurrentModel(),
             messages: [
               { role: 'system', content: '你是一个数据分析专家，只能输出严格结构化JSON对象。' },
               { role: 'user', content: explainPrompt }

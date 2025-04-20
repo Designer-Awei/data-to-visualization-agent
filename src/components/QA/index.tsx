@@ -253,23 +253,26 @@ export const QA: React.FC = () => {
       })
       if (!response.ok) {
         let errorMsg = `请求失败，状态码${response.status}`
-        let errorContent = ''
+        let errorDetail = ''
         try {
           const errorData = await response.json()
           errorMsg = errorData.error || errorMsg
-          errorContent = `【LLM服务异常】${errorMsg}`
-        } catch {
-          errorContent = `【LLM服务异常】LLM API请求失败，状态码${response.status}`
-        }
+          errorDetail = errorData.detail || ''
+        } catch {}
+        /**
+         * 优化：将error和detail都塞入assistant消息，便于前端渲染详细错误
+         */
         setState(prev => ({
           ...prev,
           isLoading: false,
-          error: errorMsg,
+          error: errorMsg + (errorDetail ? `\n${errorDetail}` : ''),
           messages: [
             ...prev.messages,
             {
               role: 'assistant',
-              content: errorContent || '【LLM服务异常】未知错误',
+              content: errorMsg + (errorDetail ? `\n${errorDetail}` : ''),
+              error: errorMsg,
+              detail: errorDetail,
               confidence: undefined
             } as Message
           ]
@@ -447,15 +450,22 @@ export const QA: React.FC = () => {
           <div className="bg-gray-50 rounded-lg p-4 h-96 overflow-y-auto">
             {state.messages.map((msg, index) => {
               if (msg.role === 'assistant') {
-                // 兜底：content为空、null、空对象、空字符串时强制显示错误
+                /**
+                 * 优化：优先渲染content，其次渲染error/detail，最后才兜底显示未知错误
+                 */
                 let safeContent = msg.content
+                // 若content为空，尝试用error/detail补充
                 if (
                   safeContent === undefined ||
                   safeContent === null ||
                   (typeof safeContent === 'string' && !safeContent.trim()) ||
                   (typeof safeContent === 'object' && (!safeContent || Object.keys(safeContent).length === 0))
                 ) {
-                  safeContent = '【LLM服务异常】未知错误'
+                  if (msg.error || msg.detail) {
+                    safeContent = `${msg.error || ''}${msg.detail ? '\n' + msg.detail : ''}`
+                  } else {
+                    safeContent = '【LLM服务异常】未知错误'
+                  }
                 }
                 // 新增：只返回 analysis 时直接渲染 analysis
                 if (typeof safeContent === 'object' && (safeContent as any).analysis) {

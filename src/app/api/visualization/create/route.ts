@@ -4,7 +4,7 @@ import fs from 'fs'
 import path from 'path'
 
 /**
- * 调用Python脚本安全执行plotly代码
+ * 调用Python脚本安全执行plotly代码，兼容多行JSON输出，只取最后一行合法JSON
  * @param {string} code - LLM生成的plotly代码
  * @param {any[]} data - 数据
  * @returns {Promise<any>} - plotly_figure
@@ -14,24 +14,51 @@ async function runPlotlyPython(code: string, data: any[]): Promise<any> {
     const tmpData = path.join(process.cwd(), 'tmp_plot_data.json')
     const tmpCode = path.join(process.cwd(), 'tmp_plot_code.py')
     fs.writeFileSync(tmpData, JSON.stringify(data, null, 2))
-    // 拼接完整python脚本
-    const pyCode = `import json\nimport plotly.graph_objs as go\nwith open(r'${tmpData}', 'r', encoding='utf-8') as f:\n    data = json.load(f)\n${code}\nprint(json.dumps(result, ensure_ascii=False))\n`
+    // 拼接完整python脚本，强制utf-8输出，防止中文乱码
+    const pyCode = `import sys\nimport io\nsys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')\nsys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')\nimport json\nimport plotly.graph_objs as go\nwith open(r'${tmpData}', 'r', encoding='utf-8') as f:\n    data = json.load(f)\n${code}\nprint(json.dumps(result, ensure_ascii=False))\n`
     fs.writeFileSync(tmpCode, pyCode)
     const py = spawn('python', [tmpCode])
+    py.stdout.setEncoding('utf8')
+    py.stderr.setEncoding('utf8')
     let output = ''
+    let stderr = ''
     py.stdout.on('data', (d) => { output += d.toString() })
-    py.stderr.on('data', (d) => { console.error('Python错误:', d.toString()) })
-    py.on('close', (code) => {
+    py.stderr.on('data', (d) => { stderr += d.toString(); console.error('Python错误:', d.toString()) })
+    py.on('close', (codeNum) => {
       fs.unlinkSync(tmpData)
       fs.unlinkSync(tmpCode)
-      if (code === 0) {
+      if (codeNum === 0) {
         try {
-          resolve(JSON.parse(output))
+          /**
+           * 兼容多行JSON输出，只取最后一行合法JSON
+           */
+          const lines = output.split('\n').map(line => line.trim()).filter(Boolean)
+          let lastValid = null
+          for (let i = lines.length - 1; i >= 0; i--) {
+            try {
+              lastValid = JSON.parse(lines[i])
+              break
+            } catch {}
+          }
+          if (lastValid) {
+            resolve(lastValid)
+          } else {
+            reject({
+              error: 'Python输出无有效JSON',
+              detail: output
+            })
+          }
         } catch (e) {
-          reject(e)
+          reject({
+            error: 'Python绘图脚本执行失败（JSON解析异常）',
+            detail: `Node.js JSON.parse异常: ${e instanceof Error ? e.message : String(e)}\nPython stderr: ${stderr}\nPython输出: ${output}`
+          })
         }
       } else {
-        reject(new Error('Python绘图脚本执行失败'))
+        reject({
+          error: 'Python绘图脚本执行失败',
+          detail: `Python stderr: ${stderr}\nPython输出: ${output}`
+        })
       }
     })
   })
@@ -78,7 +105,7 @@ async function callLLMWithRetry(params: any, maxRetry = 2) {
  * @returns {string}
  */
 function buildUniversalPlotSystemPrompt(userFields: string[], dataPreview: any[], question: string): string {
-  return `你是一个通用数据分析和可视化专家，面对实验、仓储、财务、销售等各类表格。无论用户如何提问，你只能输出Python代码块（用\u0060\u0060\u0060python ... \u0060\u0060\u0060包裹），且代码最后必须有如下格式：\nresult = {...}\nprint(json.dumps(result, ensure_ascii=False))\n不能输出其他print语句或分析文本，否则会被判为错误。\n你只能直接使用变量 data（类型为 list[dict]，每个 dict 的 key 为字段名），禁止使用 pd.read_excel、open、os、path 等任何本地文件读取操作。\n【重要约束】：\n- 你只能对如下"相关字段"进行聚合、绘图等操作，不能用 row.values()、item.values() 等方式：\n  ${userFields.join('、')}\n- 字段名必须严格按数据示例中的字段名书写，且为字符串类型。\n- 相关字段的名称可能为中文、英文、拼音、缩写或数字，请严格按给定字段名处理。\n数据示例（仅供参考）：\n${JSON.stringify(dataPreview, null, 2)}\n用户问题：${question}\n\n【Python代码示例】\nfields = ${JSON.stringify(userFields)}\n# 以聚合为例，计算每行相关字段的和\ntotals = [sum([item[f] for f in fields]) for item in data]\n# ... 你的绘图代码 ...`;
+  return `你是一个通用数据分析和可视化专家，面对实验、仓储、财务、销售等各类表格。无论用户如何提问，你只能输出Python代码块（用\u0060\u0060\u0060python ... \u0060\u0060\u0060包裹），且代码最后必须有如下格式：\nresult = {...}\nprint(json.dumps(result, ensure_ascii=False))\n不能输出其他print语句或分析文本，否则会被判为错误。\n你只能直接使用变量 data（类型为 list[dict]，每个 dict 的 key 为字段名），禁止使用 pd.read_excel、open、os、path 等任何本地文件读取操作。\n【重要约束】：\n- 你只能对如下\"相关字段\"进行聚合、绘图等操作，不能用 row.values()、item.values() 等方式：\n  ${userFields.join('、')}\n- 字段名必须严格按数据示例中的字段名书写，且为字符串类型。\n- 相关字段的名称可能为中文、英文、拼音、缩写或数字，请严格按给定字段名处理。\n- 禁止生成fig.show()、plt.show()、open_browser等任何弹窗或本地显示相关代码，只能生成plotly图表对象并输出其figure的JSON。\n- 你的代码最后必须有result = fig.to_dict()，并print(json.dumps(result, ensure_ascii=False))，不能有fig.show()。\n数据示例（仅供参考）：\n${JSON.stringify(dataPreview, null, 2)}\n用户问题：${question}\n\n【Python代码示例】\nfields = ${JSON.stringify(userFields)}\n# 以聚合为例，计算每行相关字段的和\ntotals = [sum([item[f] for f in fields]) for item in data]\n# ... 你的绘图代码 ...`;
 }
 
 /**
@@ -92,7 +119,7 @@ function hasNoResultDefinition(code: string): boolean {
 }
 
 /**
- * 泛化型绘图字段提取agent，完全依赖LLM智能判断
+ * 泛化型绘图字段提取agent，完全依赖LLM智能判断，且只返回真实存在的字段
  * @param {string} question 用户问题
  * @param {any[]} data 原始数据
  * @returns {Promise<string[]>} 相关字段
@@ -104,7 +131,7 @@ async function extractPlotFieldsLLM(question: string, data: any[]): Promise<stri
 你是一个通用数据分析专家。请根据用户问题和数据字段，返回本轮绘图最相关的字段名数组（只返回JSON数组，不要解释）：\n用户问题：${question}\n所有字段：${JSON.stringify(allFields)}\n数据示例：${JSON.stringify(dataPreview, null, 2)}\n`
   // 调用LLM
   const res = await callLLMWithRetry({
-    model: process.env.MODEL_NAME,
+    model: getCurrentModel(),
     messages: [
       { role: 'system', content: '你是数据分析专家，只返回JSON数组。' },
       { role: 'user', content: prompt }
@@ -120,6 +147,8 @@ async function extractPlotFieldsLLM(question: string, data: any[]): Promise<stri
     // 兜底：只用所有数值型字段
     fields = allFields.filter(f => typeof data[0][f] === 'number')
   }
+  // 只保留真实存在的字段，防止LLM脑补
+  fields = fields.filter(f => allFields.includes(f))
   return fields
 }
 
@@ -151,7 +180,7 @@ async function detectPlotDataStatus(question: string, plotFields: string[], plot
   const prompt = `
 你是一个数据分析专家。请根据用户问题、字段和数据样本，判断绘图数据是否需要二次计算，返回如下JSON格式（只返回JSON，不要解释）：\n{"status": "origin/todo/both"}\norigin：可直接用原始数据绘图\ntodo：需要对原始数据做二次计算（如总分、均值、分组统计等）后才能绘图\nboth：既需要原始数据又需要二次计算后的数据\n用户问题：${question}\n字段：${JSON.stringify(plotFields)}\n数据样本：${JSON.stringify(plotData.slice(0, 5), null, 2)}\n`
   const res = await callLLMWithRetry({
-    model: process.env.MODEL_NAME,
+    model: getCurrentModel(),
     messages: [
       { role: 'system', content: '你是数据分析专家，只返回JSON结构。' },
       { role: 'user', content: prompt }
@@ -184,10 +213,10 @@ async function calcPlotDataWithLLM(question: string, plotData: any[]): Promise<a
   // 取前5行样本，构造prompt
   const dataPreview = plotData.slice(0, 5)
   const fields = plotData[0] ? Object.keys(plotData[0]) : []
-  const prompt = `你是一个资深数据分析师。请根据用户问题和数据样本，生成pandas代码对数据做二次计算（如总分、均值、分组统计等），并输出新的DataFrame（只返回代码块，变量名为df，结果变量为result_df，必须print(result_df.to_json(orient='records', force_ascii=False))）。\n用户问题：${question}\n字段：${JSON.stringify(fields)}\n数据样本：${JSON.stringify(dataPreview, null, 2)}\n【代码示例】\nimport pandas as pd\ndf = pd.DataFrame(data)\n# ... 你的处理 ...\nresult_df = ... # 处理后的DataFrame\nprint(result_df.to_json(orient='records', force_ascii=False))\n`
+  const prompt = `你是一个资深数据分析师。请根据用户问题和数据样本，生成pandas代码对数据做二次计算（如总分、均值、分组统计等），并输出新的DataFrame（只返回代码块，变量名为df，结果变量为result_df，必须print(result_df.to_json(orient='records', force_ascii=False))）。\n【重要约束】你只能用pandas做数据处理，禁止生成任何matplotlib、seaborn、plt等绘图库相关代码，禁止import这些库。字段名必须严格按样本数据中的字段名书写，禁止随意拼写、换行、添加空格，禁止用fields=...硬编码。\n用户问题：${question}\n字段：${JSON.stringify(fields)}\n数据样本：${JSON.stringify(dataPreview, null, 2)}\n【代码示例】\nimport pandas as pd\ndf = pd.DataFrame(data)\n# ... 你的处理 ...\nresult_df = ... # 处理后的DataFrame\nprint(result_df.to_json(orient='records', force_ascii=False))\n`
   // 调用LLM生成代码
   const res = await callLLMWithRetry({
-    model: process.env.MODEL_NAME,
+    model: getCurrentModel(),
     messages: [
       { role: 'system', content: '你是数据分析专家，只返回Python代码块。' },
       { role: 'user', content: prompt }
@@ -207,10 +236,10 @@ async function calcPlotDataWithLLM(question: string, plotData: any[]): Promise<a
   // 用Python执行代码，传入plotData
   const tmpData = path.join(process.cwd(), 'tmp_calc_data.json')
   const tmpCode = path.join(process.cwd(), 'tmp_calc_code.py')
-  fs.writeFileSync(tmpData, JSON.stringify(plotData, null, 2))
-  // 拼接完整python脚本
-  const pyCode = `import json\nimport pandas as pd\nwith open(r'${tmpData}', 'r', encoding='utf-8') as f:\n    data = json.load(f)\n${code}\n`
-  fs.writeFileSync(tmpCode, pyCode)
+  fs.writeFileSync(tmpData, JSON.stringify(plotData, null, 2), { encoding: 'utf-8' })
+  // 拼接完整python脚本，强制utf-8
+  const pyCode = `import sys\nimport io\nsys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')\nsys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')\nimport json\nimport pandas as pd\nwith open(r'${tmpData}', 'r', encoding='utf-8') as f:\n    data = json.load(f)\n${code}\n`
+  fs.writeFileSync(tmpCode, pyCode, { encoding: 'utf-8' })
   return new Promise((resolve, reject) => {
     const py = spawn('python', [tmpCode])
     let output = ''
@@ -234,6 +263,14 @@ async function calcPlotDataWithLLM(question: string, plotData: any[]): Promise<a
 }
 
 /**
+ * 获取当前全局LLM模型名，优先用globalThis.currentLLMModel，没有则用.env默认
+ * @returns {string}
+ */
+function getCurrentModel() {
+  return (globalThis as any).currentLLMModel || process.env.DEFAULT_MODEL
+}
+
+/**
  * 智能绘图API（新版链路）
  * @param {Request} request - POST请求，包含question, data, columns
  * @returns {Promise<Response>} - plotly_figure及answer
@@ -247,10 +284,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: '缺少问题或数据' }, { status: 400 })
     }
 
-    const model = params.model || process.env.DEFAULT_MODEL
-    if (!model) {
-      return NextResponse.json({ error: '未指定模型' }, { status: 400 })
-    }
+    const model = getCurrentModel()
     console.log('[LLM调用] 当前模型:', model)
 
     // 1. 字段提取agent：提取与绘图相关的字段和结构化数据
@@ -271,7 +305,7 @@ export async function POST(request: Request) {
         console.log('[绘图数据计算agent] 处理后数据样本:', finalPlotData.slice(0, 3))
       } catch (e) {
         console.error('[绘图数据计算agent] 数据二次计算失败:', e)
-        return NextResponse.json({ error: '数据二次计算失败', detail: String(e) }, { status: 500 })
+        return NextResponse.json({ error: '[绘图数据计算agent] 数据二次计算失败', detail: String(e) }, { status: 500 })
       }
     }
 
@@ -314,9 +348,14 @@ export async function POST(request: Request) {
     try {
       plotly_figure = await runPlotlyPython(llmCode, finalPlotData)
       console.log('[Python执行] plotly_figure生成成功')
-    } catch (e) {
-      console.error('[Python执行] 图表生成失败:', e, '\nLLM代码如下:\n', llmCode)
-      return NextResponse.json({ error: '图表生成失败', detail: String(e), llmCode }, { status: 500 })
+    } catch (e: any) {
+      /**
+       * 捕获runPlotlyPython的详细错误，完整返回error、detail、llmCode
+       */
+      const errMsg = e?.error || '图表生成失败'
+      const errDetail = e?.detail || (e instanceof Error ? e.message : String(e))
+      console.error('[Python执行] 图表生成失败:', errMsg, errDetail, '\nLLM代码如下:\n', llmCode)
+      return NextResponse.json({ error: errMsg, detail: errDetail, llmCode }, { status: 500 })
     }
 
     // 6. 返回结构
