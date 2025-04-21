@@ -68,6 +68,14 @@ function splitMarkdownSegments(content: string): Array<{type: 'text', content: s
 
 type QAStateFixed = QAState & { plotlyFigure?: any }
 
+// 开场白初始化
+const initialMessages = [
+  {
+    role: 'assistant',
+    content: '你好，我是数据可视化智能助手，能够基于您提供的数据问答与绘图！'
+  }
+]
+
 export const QA: React.FC = () => {
   const [state, setState] = useState<QAStateFixed>({
     question: '',
@@ -76,16 +84,20 @@ export const QA: React.FC = () => {
     answer: null,
     model: 'THUDM/GLM-4-9B-0414',
     data: null,
-    messages: [],
+    messages: initialMessages as Message[],
     plotlyFigure: null
   })
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const chartPreviewRef = useRef<HTMLDivElement>(null)
 
   // 仅在成功生成图表时自动滚动到底部
   useEffect(() => {
     if (state.plotlyFigure) {
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
+      setTimeout(() => {
+        chartPreviewRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+      }, 300)
     }
   }, [state.plotlyFigure])
 
@@ -461,8 +473,8 @@ export const QA: React.FC = () => {
                   (typeof safeContent === 'string' && !safeContent.trim()) ||
                   (typeof safeContent === 'object' && (!safeContent || Object.keys(safeContent).length === 0))
                 ) {
-                  if (msg.error || msg.detail) {
-                    safeContent = `${msg.error || ''}${msg.detail ? '\n' + msg.detail : ''}`
+                  if ('error' in msg || 'detail' in msg) {
+                    safeContent = `${('error' in msg ? msg.error : '')}${('detail' in msg ? '\n' + msg.detail : '')}`
                   } else {
                     safeContent = '【LLM服务异常】未知错误'
                   }
@@ -620,8 +632,9 @@ export const QA: React.FC = () => {
         </div>
       </div>
 
-      <div className="bg-white p-6 rounded-lg shadow mt-6">
+      <div className="bg-white p-6 rounded-lg shadow mt-6" ref={chartPreviewRef}>
         <h3 className="text-lg font-medium mb-2">图表预览</h3>
+        {(() => { console.log('plotlyFigure:', state.plotlyFigure); return null })()}
         {state.plotlyFigure ? (
           <>
             <Plot data={state.plotlyFigure.data} layout={state.plotlyFigure.layout} style={{width: '100%', height: '480px'}} config={{responsive: true}} />
