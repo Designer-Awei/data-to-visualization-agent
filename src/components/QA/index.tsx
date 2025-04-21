@@ -227,13 +227,13 @@ export const QA: React.FC = () => {
     if (!state.question.trim() || state.isLoading) return
     setInputDisabled(true)
     setIsAborting(false)
-    // 页面展示：累加所有历史消息
     setState(prev => ({
       ...prev,
       isLoading: true,
       error: null,
       question: '',
-      messages: [...prev.messages, { role: 'user', content: prev.question }]
+      messages: [...prev.messages, { role: 'user', content: prev.question }],
+      plotlyFigure: null // 每次提交时重置
     }))
     const controller = new AbortController()
     setAbortController(controller)
@@ -271,9 +271,6 @@ export const QA: React.FC = () => {
           errorMsg = errorData.error || errorMsg
           errorDetail = errorData.detail || ''
         } catch {}
-        /**
-         * 优化：将error和detail都塞入assistant消息，便于前端渲染详细错误
-         */
         setState(prev => ({
           ...prev,
           isLoading: false,
@@ -634,7 +631,6 @@ export const QA: React.FC = () => {
 
       <div className="bg-white p-6 rounded-lg shadow mt-6" ref={chartPreviewRef}>
         <h3 className="text-lg font-medium mb-2">图表预览</h3>
-        {(() => { console.log('plotlyFigure:', state.plotlyFigure); return null })()}
         {state.plotlyFigure ? (
           <>
             <Plot data={state.plotlyFigure.data} layout={state.plotlyFigure.layout} style={{width: '100%', height: '480px'}} config={{responsive: true}} />
