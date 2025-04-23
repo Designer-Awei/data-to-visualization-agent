@@ -174,6 +174,12 @@ export const QA: React.FC = () => {
       model: value,
       error: null
     }))
+    // 新增：切换模型即发请求到后端
+    fetch('/api/set-model', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: value })
+    })
   }
 
   // 文件上传配置

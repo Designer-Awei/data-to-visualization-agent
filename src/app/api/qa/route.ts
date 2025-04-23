@@ -86,11 +86,11 @@ export async function POST(request: Request) {
     const intent = await detectIntent(question)
     const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || 'http://localhost:3000'
     if (intent === 'plot') {
-      // 分流到绘图API
+      // 分流到绘图API，确保传递model参数
       const resp = await fetch(`${baseUrl}/api/visualization/create`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, data, columns, messages })
+        body: JSON.stringify({ question, data, columns, messages, model: params.model })
       })
       const result = await resp.json()
       return NextResponse.json(result)

@@ -11,5 +11,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: '模型名无效' }, { status: 400 })
   }
   (globalThis as any).currentLLMModel = model
+  console.log(`[模型切换API] 已切换为: ${model}`)
   return NextResponse.json({ success: true, model })
 } 
