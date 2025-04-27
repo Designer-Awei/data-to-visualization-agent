@@ -65,6 +65,30 @@ async function runPlotlyPython(code: string, data: any[]): Promise<any> {
 }
 
 /**
+ * 清洗LLM生成的Python代码，移除所有fig.show()、plt.show()、open_browser等本地弹窗/浏览器打开命令
+ * 以及所有data重新定义相关代码
+ * @param {string} code - LLM生成的Python代码
+ * @returns {string} - 清洗后的代码
+ */
+function cleanPlotlyCode(code: string): string {
+  return code
+    // 移除fig.show/plt.show/open_browser/webbrowser.open等
+    .replace(/\bfig\.show\s*\(.*?\)\s*;?/g, '')
+    .replace(/\bplt\.show\s*\(.*?\)\s*;?/g, '')
+    .replace(/\bopen_browser\s*\(.*?\)\s*;?/g, '')
+    .replace(/\bimport\s+webbrowser\b.*/g, '')
+    .replace(/webbrowser\.open\s*\(.*?\)\s*;?/g, '')
+    // 移除所有data重新定义相关代码
+    // 兼容低版本JS，避免使用gs标志
+    .replace(/data\s*=\s*\[[\s\S]*?\](\s*#.*)?/g, '') // data = [ ... ]
+    .replace(/data\s*=\s*list\(.*?\)(\s*#.*)?/g, '') // data = list(...)
+    .replace(/data\s*=\s*json\.loads\(.*?\)(\s*#.*)?/g, '') // data = json.loads(...)
+    .replace(/data\s*=\s*pd\.read_.*?\(.*?\)(\s*#.*)?/g, '') // data = pd.read_...
+    .replace(/data\s*=\s*open\(.*?\)(\s*#.*)?/g, '') // data = open(...)
+    .replace(/data\s*=\s*.*?DataFrame\(.*?\)(\s*#.*)?/g, '') // data = ...DataFrame(...)
+}
+
+/**
  * 用fetch直连SiliconFlow LLM API，兼容OpenAI chat.completions.create参数
  * @param {object} params - 请求参数，需包含model、messages等
  * @param {number} [maxRetry=2] - 最大重试次数
@@ -109,35 +133,64 @@ function buildUniversalPlotSystemPrompt(userFields: string[], dataPreview: any[]
 }
 
 /**
+ * 错误推理agent，分析代码报错原因并给出修改建议
+ * @param {string} userQuestion 用户问题
+ * @param {string} lastCode 上次代码
+ * @param {string} errorMsg 报错信息
+ * @param {string} model LLM模型名
+ * @returns {Promise<string>} 错误分析和修改建议
+ */
+async function errorAnalysisAgent(userQuestion: string, lastCode: string, errorMsg: string, model: string): Promise<string> {
+  const prompt = `你是一个代码错误分析专家。请根据用户问题、上次生成的Python代码和报错信息，推理错误原因，并给出详细的修改建议。只输出分析和建议，不要输出代码。
+【用户问题】${userQuestion}
+【上次代码】
+${lastCode}
+【报错信息】
+${errorMsg}`
+  const res = await callLLMWithRetry({
+    model,
+    messages: [
+      { role: 'system', content: '你是代码错误分析专家，只输出分析和建议。' },
+      { role: 'user', content: prompt }
+    ],
+    temperature: 0.2,
+    max_tokens: 512
+  })
+  return res.choices[0]?.message?.content || ''
+}
+
+/**
  * 智能代码修复agent prompt生成，强化禁止写死data的约束，给出正反例。
  * 泛化：无论是二维、三维、极坐标、堆叠、分组等任意类型的plotly图表，只要x/y/z/angle/r等参数不是原始data的字段，都必须先用原始data生成适配的中间DataFrame，再绘图。
  * @param {string} userQuestion
  * @param {any[]} dataPreview
  * @param {string} lastCode
  * @param {string} errorMsg
+ * @param {string} [errorAnalysis] 错误推理agent输出的分析和建议
  * @returns {string}
  */
-function buildCodeFixAgentPrompt(userQuestion: string, dataPreview: any[], lastCode: string, errorMsg: string): string {
-  return `你是一个代码修复专家。用户希望基于如下数据和问题生成plotly图表，但你上次生成的Python代码执行报错。请根据报错信息，推理错误原因，并修正代码，只返回修正后的完整Python代码块（用\u0060\u0060\u0060python ... \u0060\u0060\u0060包裹），代码最后必须有result = ...并print(json.dumps(result, ensure_ascii=False))。
+function buildCodeFixAgentPrompt(userQuestion: string, dataPreview: any[], lastCode: string, errorMsg: string, errorAnalysis?: string): string {
+  return `你是一个代码修复专家。用户希望基于如下数据和问题生成plotly图表，但你上次生成的Python代码执行报错。请根据报错信息和错误分析，推理错误原因，并修正代码，只返回修正后的完整Python代码块（用\u0060\u0060\u0060python ... \u0060\u0060\u0060包裹），代码最后必须有result = ...并print(json.dumps(result, ensure_ascii=False))。
 【用户问题】${userQuestion}
 【数据样本】${JSON.stringify(dataPreview, null, 2)}
 【上次代码】
 ${lastCode}
 【报错信息】
 ${errorMsg}
+${errorAnalysis ? `【错误分析和修改建议】\n${errorAnalysis}` : ''}
 
 【重要约束】：
 - 你只能直接使用变量data（类型为list[dict]），禁止在代码中出现data = [...]、data = list(...)、data = json.loads(...)等任何重新定义data变量的写法，否则会被判为错误。
 - 只允许直接遍历data变量，不能重新赋值data。
 - 如果你不确定data的内容，直接用data变量，不要重新定义。
 - 【泛化要求】无论是二维、三维、极坐标、堆叠、分组等任意类型的plotly图表，只要x/y/z/angle/r等参数不是原始data的字段，都必须先用原始data生成适配的中间DataFrame，再绘图。
-- 如果报错信息中包含“字段不存在”或“x/y/z/angle/r不是data中的字段”，你必须先用原始data生成适配结构的数据，再用该DataFrame绘图。
-- 例如：先用pandas或列表推导生成“学科-平均分”、“极坐标的角度-半径”、“三维x/y/z”结构的数据，再用plotly绘制。
+- 如果报错信息中包含"字段不存在"或"x/y/z/angle/r不是data中的字段"，你必须先用原始data生成适配结构的数据，再用该DataFrame绘图。
+- 例如：先用pandas或列表推导生成"学科-平均分"、"极坐标的角度-半径"、"三维x/y/z"结构的数据，再用plotly绘制。
 
 【反例】（错误写法）：
-fig = px.scatter(data, x="极角", y="半径")  # data中没有“极角”或“半径”字段
+fig = px.scatter(data, x="极角", y="半径")  # data中没有"极角"或"半径"字段
 fig = px.scatter_3d(data, x="x", y="y", z="z")  # data中没有x/y/z字段
-fig = px.bar(data, x="分组", y="总分")  # data中没有“分组”或“总分”字段
+fig = px.bar(data, x="分组", y="总分")  # data中没有"分组"或"总分"字段
 
 【正例】（正确写法）：
 # 极坐标
@@ -334,32 +387,31 @@ function getCurrentModel() {
 }
 
 /**
- * 代码修复agent：根据报错信息修正LLM生成的Python代码
- * @param {object} params - { userQuestion, plotData, lastCode, errorMsg }
- * @param {string} model - LLM模型名
- * @returns {Promise<string>} - 修正后的Python代码
+ * 调用代码修复agent，支持错误分析输入
+ * @param {object} params - { userQuestion, plotData, lastCode, errorMsg, errorAnalysis }
+ * @param {string} model LLM模型名
+ * @returns {Promise<string>} 修正后的代码
  */
-async function callCodeFixAgent(params: { userQuestion: string, plotData: any[], lastCode: string, errorMsg: string }, model: string): Promise<string> {
-  const { userQuestion, plotData, lastCode, errorMsg } = params
+async function callCodeFixAgent(params: { userQuestion: string, plotData: any[], lastCode: string, errorMsg: string, errorAnalysis?: string }, model: string): Promise<string> {
+  const { userQuestion, plotData, lastCode, errorMsg, errorAnalysis } = params
   const dataPreview = plotData.slice(0, 5)
-  const prompt = buildCodeFixAgentPrompt(userQuestion, dataPreview, lastCode, errorMsg)
+  const prompt = buildCodeFixAgentPrompt(userQuestion, dataPreview, lastCode, errorMsg, errorAnalysis)
   const res = await callLLMWithRetry({
     model,
     messages: [
-      { role: 'system', content: '你是代码修复专家，只返回修正后的Python代码块。' },
+      { role: 'system', content: '你是代码修复专家，只输出修正后的完整Python代码块。' },
       { role: 'user', content: prompt }
     ],
     temperature: 0.2,
     max_tokens: 1024
   })
+  // 只提取代码块
   const content = res.choices[0]?.message?.content || ''
-  const code = content.match(/```python([\s\S]*?)```/)
-    ? content.match(/```python([\s\S]*?)```/)[1]
-    : content.replace(/```/g, '').trim()
-  console.log('[代码修复agent] 收到报错信息，开始修复...')
-  console.log('[代码修复agent] 上次代码:', lastCode)
-  console.log('[代码修复agent] 报错信息:', errorMsg)
-  return code
+  const codeMatch = content.match(/```python([\s\S]*?)```/)
+  const fixedCode = codeMatch ? codeMatch[1].trim() : content.trim()
+  console.log('[代码修复agent] 执行状态: 成功')
+  console.log('[代码修复agent] 修复后的代码：\n```python\n' + fixedCode + '\n```')
+  return fixedCode
 }
 
 /**
@@ -383,10 +435,12 @@ async function callCodeGenAgent(systemPrompt: string, userQuestion: string, mode
   let llmCode = content.match(/```python([\s\S]*?)```/)
     ? content.match(/```python([\s\S]*?)```/)[1]
     : content.replace(/```/g, '').trim()
+  
   if (llmCode && !hasNoResultDefinition(llmCode)) {
-    console.log('[智能代码生成agent] 执行成功')
+    console.log('[智能代码生成agent] 执行状态: 成功')
+    console.log('[智能代码生成agent] 生成的代码：\n```python\n' + llmCode + '\n```')
   } else {
-    console.error('[智能代码生成agent] 执行失败（缺少result定义）')
+    console.log('[智能代码生成agent] 执行状态: 失败（缺少result定义）')
   }
   return llmCode
 }
@@ -441,7 +495,8 @@ async function runCodeWithAutoFieldCheck(code: string, data: any[]): Promise<any
   if (x && y && !checkXYFieldsMatch(data, x, y)) {
     throw new Error(`[autoCheck] x/y字段与data不匹配，需先生成中间DataFrame。如需绘制"学科-平均分"，请先用原始data生成"学科-平均分"结构的数据，再绘图。`)
   }
-  return await originalRunCodeFn(code, data)
+  // 自动清洗fig.show等命令和data重新定义
+  return await originalRunCodeFn(cleanPlotlyCode(code), data)
 }
 
 /**
@@ -470,19 +525,23 @@ async function autoFixWithCodeRepairAgent({
   let lastError = errorMsg
   for (let fixCount = 0; fixCount <= maxRetry; fixCount++) {
     try {
-      // runCodeFn: (code, data) => Promise<any>
-      return await runCodeFn(tryCode, plotData)
-    } catch (e) {
-      lastError = getErrorMsg(e)
+      const errorAnalysis = await errorAnalysisAgent(userQuestion, tryCode, lastError, model)
+      console.log('[错误推理agent] 执行状态: 成功')
+      console.log('[错误推理agent] 错误分析：\n' + errorAnalysis)
+      
       tryCode = await callCodeFixAgent({
         userQuestion,
         plotData,
         lastCode: tryCode,
-        errorMsg: lastError
+        errorMsg: lastError,
+        errorAnalysis: errorAnalysis
       }, model)
+      return await runCodeFn(tryCode, plotData)
+    } catch (e) {
+      lastError = getErrorMsg(e)
     }
   }
-  throw new Error(`[autoFixWithCodeRepairAgent] 代码修复多次失败: ${lastError}`)
+  throw new Error(`[autoFixWithCodeRepairAgent] 执行状态: 失败（代码修复多次失败: ${lastError}）`)
 }
 
 /**
@@ -493,9 +552,20 @@ async function autoFixWithCodeRepairAgent({
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const model = body.model || process.env.MODEL_NAME || 'THUDM/GLM-4-9B-0414';
+    // 修改获取模型的逻辑，优先使用前端传递的模型，其次是全局变量，最后是环境变量
+    const frontendModel = body.model; // 前端传递的模型
+    const globalModel = (globalThis as any).currentLLMModel; // 全局模型变量
+    const defaultModel = process.env.MODEL_NAME || 'THUDM/GLM-4-9B-0414';
+    
+    // 优先级：前端传递 > 全局变量 > 环境变量默认值
+    const model = frontendModel || globalModel || defaultModel;
+    
+    // 将选择的模型设置为全局变量，确保后续请求使用相同模型
+    (globalThis as any).currentLLMModel = model;
+    
     // 新增模型切换日志
-    console.log(`[模型切换] 当前模型已切换为: ${model}`);
+    console.log(`[模型切换] 当前模型已切换为: ${model}，来源: ${frontendModel ? '前端传递' : (globalModel ? '全局变量' : '环境变量默认值')}`);
+    
     const question = body.question
     const data = body.data || []
     if (!question || !Array.isArray(data) || data.length === 0) {
@@ -504,14 +574,15 @@ export async function POST(request: Request) {
 
     // 1. 字段提取agent：提取与绘图相关的字段和结构化数据
     const { plotFields, plotData } = await extractPlotFieldsAndData(question, data, model)
-    console.log('[字段提取agent] 用户问题:', question, '\n可用字段:', plotFields, '\n样本数据:', plotData.slice(0, 3))
+    console.log('[字段提取agent] 执行状态: 成功')
+    console.log('[字段提取agent] 提取的字段：', JSON.stringify(plotFields))
     if (!plotFields.length) {
       return NextResponse.json({ error: '未能识别出可用字段' }, { status: 400 })
     }
 
     // 2. 数据处理逻辑agent：判断是否需要二次计算
     const dataStatus = await detectPlotDataStatus(question, plotFields, plotData, model)
-    console.log('[数据处理逻辑agent] 数据状态:', dataStatus)
+    console.log('[数据处理逻辑agent] 执行状态:', dataStatus)
     let finalPlotData = plotData
     // 3. 绘图数据计算agent：如需，生成并执行pandas代码
     if (dataStatus === 'todo' || dataStatus === 'both') {
@@ -522,7 +593,7 @@ export async function POST(request: Request) {
       try {
         calcResult = await calcPlotDataWithLLM(question, plotData, model)
         finalPlotData = calcResult
-        console.log('[绘图数据计算agent] 处理后数据样本:', finalPlotData.slice(0, 3))
+        console.log('[绘图数据计算agent] 执行状态: 成功')
       } catch (e) {
         calcError = getErrorMsg(e)
         // 自动进入多次修复agent
@@ -536,9 +607,9 @@ export async function POST(request: Request) {
             maxRetry: 3,
             runCodeFn: runCodeWithAutoFieldCheck
           })
-          console.log('[代码修复agent] 修复后数据样本:', finalPlotData.slice(0, 3))
+          console.log('[代码修复agent] 执行状态: 成功')
         } catch (fixErr) {
-          console.error('[代码修复agent] 修复失败:', fixErr)
+          console.error('[代码修复agent] 执行状态: 失败')
           return NextResponse.json({ error: '[绘图数据计算agent] 数据二次计算及修复均失败', detail: String(fixErr) }, { status: 500 })
         }
       }
@@ -547,12 +618,13 @@ export async function POST(request: Request) {
     // 4. 智能绘图agent：用LLM生成plotly代码（只生成一次，不重试）
     const dataPreview = finalPlotData.slice(0, 5)
     const systemPrompt = buildUniversalPlotSystemPrompt(plotFields, dataPreview, question)
-    // 恢复智能绘图agent日志，输出完整systemPrompt内容
-    console.log('[智能绘图agent] 已生成绘图需求/系统prompt:', systemPrompt)
+    console.log('[智能绘图agent] 执行状态: 已生成绘图需求')
+    console.log('[智能绘图agent] systemPrompt内容：\n' + systemPrompt)
+    
     // 智能代码生成agent：封装调用
     let llmCode = await callCodeGenAgent(systemPrompt, question, model)
     if (!llmCode || hasNoResultDefinition(llmCode)) {
-      console.error('[智能代码生成agent] 执行失败（缺少result定义）')
+      console.log('[智能代码生成agent] 执行状态: 失败（缺少result定义）')
       return NextResponse.json({ error: 'LLM未能生成有效的plotly代码（缺少result定义）' }, { status: 500 })
     }
 
@@ -568,9 +640,9 @@ export async function POST(request: Request) {
         maxRetry: 3,
         runCodeFn: runCodeWithAutoFieldCheck
       })
-      console.log('[Python执行] plotly_figure生成成功（自动修复链路）')
+      console.log('[智能绘图主流程] 执行状态: 成功')
     } catch (e) {
-      console.error('[智能绘图主流程] 代码修复多次失败，最终兜底')
+      console.error('[智能绘图主流程] 执行状态: 失败（代码修复多次失败）')
       return NextResponse.json({ error: 'LLM代码生成及修复均失败', detail: getErrorMsg(e) }, { status: 500 })
     }
 
@@ -580,7 +652,7 @@ export async function POST(request: Request) {
       plotly_figure
     })
   } catch (error) {
-    console.error('智能绘图API错误:', error)
+    console.error('[智能绘图主流程] 执行状态: 失败', error)
     return NextResponse.json({ error: '处理绘图请求时发生错误' }, { status: 500 })
   }
 } 

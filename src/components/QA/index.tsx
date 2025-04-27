@@ -91,12 +91,22 @@ export const QA: React.FC = () => {
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const chartPreviewRef = useRef<HTMLDivElement>(null)
 
-  // 仅在成功生成图表时自动滚动到底部
+  // 每次消息更新时只滚动聊天区域，不滚动整个页面
+  useEffect(() => {
+    if (messagesEndRef.current) {
+      const chatContainer = messagesEndRef.current.parentElement;
+      if (chatContainer) {
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+      }
+    }
+  }, [state.messages])
+
+  // 仅在成功生成图表时自动滚动到图表预览区域
   useEffect(() => {
     if (state.plotlyFigure) {
-      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
       setTimeout(() => {
-        chartPreviewRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+        // 使用scrollIntoView但指定选项，避免整页滚动
+        chartPreviewRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
       }, 300)
     }
   }, [state.plotlyFigure])
@@ -350,6 +360,17 @@ export const QA: React.FC = () => {
     }
   }
 
+  /**
+   * 清空对话历史
+   */
+  const clearChat = () => {
+    setState(prev => ({
+      ...prev,
+      messages: initialMessages as Message[],
+      plotlyFigure: null
+    }))
+  }
+
   return (
     <div className="space-y-6">
       {/* 右上角齿轮设置按钮 */}
@@ -433,32 +454,41 @@ export const QA: React.FC = () => {
       <div className="bg-white p-6 rounded-lg shadow-sm">
         <div className="space-y-4">
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              选择模型
-            </label>
-            <Select
-              value={state.model}
-              onChange={handleModelChange}
-              className="w-full"
-              options={[
-                { 
-                  value: 'THUDM/GLM-4-9B-0414', 
-                  label: 'THUDM/GLM-4-9B-0414 (默认，32K文本，免费)' 
-                },
-                { 
-                  value: 'Qwen/Qwen2.5-7B-Instruct', 
-                  label: 'Qwen/Qwen2.5-7B-Instruct (备选，32K文本，免费)' 
-                },
-                { 
-                  value: 'THUDM/GLM-Z1-32B-0414', 
-                  label: 'THUDM/GLM-Z1-32B-0414 (备选，32K文本，付费)' 
-                },
-                { 
-                  value: 'deepseek-ai/DeepSeek-V3', 
-                  label: 'deepseek-ai/DeepSeek-V3 (备选，64k文本，付费)' 
-                }
-              ]}
-            />
+            <div className="flex items-center space-x-2">
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                选择模型
+              </label>
+            </div>
+            <div className="flex items-center gap-1">
+              <Select
+                value={state.model}
+                onChange={handleModelChange}
+                style={{ width: 'calc(100% - 110px)' }}
+                options={[
+                  { 
+                    value: 'THUDM/GLM-4-9B-0414', 
+                    label: 'THUDM/GLM-4-9B-0414 (默认，32K文本，免费)' 
+                  },
+                  { 
+                    value: 'Qwen/Qwen2.5-7B-Instruct', 
+                    label: 'Qwen/Qwen2.5-7B-Instruct (备选，32K文本，免费)' 
+                  },
+                  { 
+                    value: 'THUDM/GLM-Z1-32B-0414', 
+                    label: 'THUDM/GLM-Z1-32B-0414 (备选，32K文本，付费)' 
+                  },
+                  { 
+                    value: 'deepseek-ai/DeepSeek-V3', 
+                    label: 'deepseek-ai/DeepSeek-V3 (备选，64k文本，付费)' 
+                  },
+                  {
+                    value: 'THUDM/GLM-4-32B-0414',
+                    label: 'THUDM/GLM-4-32B-0414 (备选，32K文本，付费)'
+                  }
+                ]}
+              />
+              <Button type="primary" danger onClick={clearChat} style={{ width: '110px' }}>清空对话</Button>
+            </div>
           </div>
 
           {/* 对话历史区域 */}

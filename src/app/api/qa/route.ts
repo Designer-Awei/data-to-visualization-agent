@@ -81,6 +81,13 @@ export async function POST(request: Request) {
     const data = params.data || []
     const columns = params.columns || (data[0] ? Object.keys(data[0]) : [])
     const messages = params.messages || []
+    const model = params.model || (globalThis as any).currentLLMModel || process.env.MODEL_NAME || 'THUDM/GLM-4-9B-0414'
+    
+    // 将当前选择的模型保存到全局变量
+    if (params.model) {
+      (globalThis as any).currentLLMModel = params.model
+      console.log(`[问答分流API] 全局模型已更新为: ${params.model}`)
+    }
 
     // 1. 先意图识别
     const intent = await detectIntent(question)
@@ -90,16 +97,16 @@ export async function POST(request: Request) {
       const resp = await fetch(`${baseUrl}/api/visualization/create`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, data, columns, messages, model: params.model })
+        body: JSON.stringify({ question, data, columns, messages, model })
       })
       const result = await resp.json()
       return NextResponse.json(result)
     } else if (intent === 'qa') {
-      // 分流到问答API
+      // 分流到问答API，确保传递model参数
       const resp = await fetch(`${baseUrl}/api/qa/ask`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, data, columns, messages })
+        body: JSON.stringify({ question, data, columns, messages, model })
       })
       const result = await resp.json()
       return NextResponse.json(result)
@@ -110,7 +117,8 @@ export async function POST(request: Request) {
         baseURL: 'https://api.siliconflow.cn/v1'
       })
       const chatRes = await client.chat.completions.create({
-        model: process.env.MODEL_NAME || 'Qwen/Qwen2.5-Coder-32B-Instruct',
+        // 使用当前选择的模型，而非固定模型
+        model,
         messages: [
           { role: 'system', content: '你是一个友好、专业的AI助手，请用简洁自然的中文回复用户问题。' },
           { role: 'user', content: question }

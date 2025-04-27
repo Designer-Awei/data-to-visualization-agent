@@ -159,7 +159,7 @@ async function extractFieldsFromQuestion(question: string, allFields: string[], 
 async function callLLMWithRetry(params: any, maxRetry = 2) {
   let lastError: any = null
   let tryMessages = params.messages || []
-  const model = getCurrentModel()
+  const model = params.model
   if (!model) {
     return NextResponse.json({ error: '未指定模型' }, { status: 400 })
   }
@@ -216,11 +216,24 @@ function getCurrentModel() {
 export async function POST(request: Request) {
   try {
     const params = await request.json()
-    const model = getCurrentModel()
+    // 修改获取模型的逻辑，优先使用前端传递的模型参数
+    const frontendModel = params.model
+    const globalModel = (globalThis as any).currentLLMModel
+    const defaultModel = process.env.MODEL_NAME || 'THUDM/GLM-4-9B-0414'
+    
+    // 优先级：前端传递 > 全局变量 > 环境变量默认值
+    const model = frontendModel || globalModel || defaultModel
+    
+    // 将模型选择保存到全局变量，确保一致性
+    if (frontendModel) {
+      (globalThis as any).currentLLMModel = frontendModel
+    }
+    
     if (!model) {
       return NextResponse.json({ error: '未指定模型' }, { status: 400 })
     }
-    console.log('[LLM调用] 当前模型:', model)
+    console.log('[LLM调用] 当前模型:', model, '来源:', frontendModel ? '前端传递' : (globalModel ? '全局变量' : '环境变量默认值'))
+    
     const { question, data, columns, messages = [] } = params
     if (!question || typeof question !== 'string' || !question.trim()) {
       return NextResponse.json({ error: '请输入问题' }, { status: 400 })
@@ -297,7 +310,7 @@ export async function POST(request: Request) {
         throw new Error(`LLM请求参数过大：messages总长度${messagesStr.length}，请减少字段或样本数量`)
       }
       const completion = await callLLMWithRetry({
-        model: getCurrentModel(),
+        model: model,
         messages: filteredMessages,
         temperature: 0.3,
         max_tokens: 1024,
@@ -338,7 +351,7 @@ export async function POST(request: Request) {
           explainPrompt = `你是一名数据分析专家。下方【计算结果】100%为后端Python真实执行所得，请严格以如下JSON格式输出：\n{\n  "analysis": "简明分析文本，需引用所有真实数值和关键信息"\n}\n请直接引用下方【计算结果】中的所有关键信息和数值，不能遗漏。\n【计算结果】：${JSON.stringify(result, null, 2)}\n请严格按照上述要求作答，只能输出JSON对象，不要输出多余内容。`;
           console.log('[二次组织agent输入prompt]', explainPrompt)
           const explainCompletion = await callLLMWithRetry({
-            model: getCurrentModel(),
+            model: model,
             messages: [
               { role: 'system', content: '你是一个数据分析专家，只能输出严格结构化JSON对象。' },
               { role: 'user', content: explainPrompt }
