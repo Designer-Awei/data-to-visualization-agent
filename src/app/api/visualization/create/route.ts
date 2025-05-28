@@ -3,6 +3,14 @@ import { spawn } from 'child_process'
 import fs from 'fs'
 import path from 'path'
 
+// 添加一个用于存储会话数据的全局存储
+const sessionStore = new Map<string, {
+  question: string;
+  data: any[];
+  model: string;
+  status: 'pending' | 'processing' | 'completed' | 'error';
+}>();
+
 /**
  * 调用Python脚本安全执行plotly代码，兼容多行JSON输出，只取最后一行合法JSON
  * @param {string} code - LLM生成的plotly代码
@@ -122,14 +130,38 @@ async function callLLMWithRetry(params: any, maxRetry = 2) {
 }
 
 /**
- * 构建通用绘图systemPrompt，禁止任何"假设data是后端传入的数据"注释，示例代码只保留直接遍历data的正例。
- * @param {string[]} userFields - 用户相关字段
- * @param {any[]} dataPreview - 数据样本
- * @param {string} question - 用户问题
+ * 构建泛化型绘图系统prompt，要求LLM自动识别字段、自动选择可视化类型和坐标轴
+ * @param {string[]} plotFields - 相关字段
+ * @param {any[]} dataPreview - 数据示例
+ * @param {string} userQuestion - 用户问题
  * @returns {string} - systemPrompt
  */
-function buildUniversalPlotSystemPrompt(userFields: string[], dataPreview: any[], question: string): string {
-  return `你是一个通用数据分析和可视化专家，面对实验、仓储、财务、销售等各类表格。无论用户如何提问，你只能输出Python代码块（用\u0060\u0060\u0060python ... \u0060\u0060\u0060包裹），且代码最后必须有如下格式：\nresult = {...}\nprint(json.dumps(result, ensure_ascii=False))\n不能输出其他print语句或分析文本，否则会被判为错误。\n你只能直接使用变量 data（类型为 list[dict]，每个 dict 的 key 为字段名），禁止使用 pd.read_excel、open、os、path 等任何本地文件读取操作。\n【重要约束】：\n- 你只能对如下"相关字段"进行聚合、绘图等操作，不能用 row.values()、item.values() 等方式：\n  ${userFields.join('、')}\n- 字段名必须严格按数据示例中的字段名书写，且为字符串类型。\n- 相关字段的名称可能为中文、英文、拼音、缩写或数字，请严格按给定字段名处理。\n- 禁止生成fig.show()、plt.show()、open_browser等任何弹窗或本地显示相关代码，只能生成plotly图表对象并输出其figure的JSON。\n- 你的代码最后必须有result = fig.to_dict()，并print(json.dumps(result, ensure_ascii=False))，不能有fig.show()。\n- 【禁止】在代码中出现 data = [...]、data = [{{...}}]、data = list(...)、data = json.loads(...) 等任何重新定义data变量的写法，必须直接使用后端传入的data变量，否则只会画出部分数据。\n数据示例（仅供参考）：\n${JSON.stringify(dataPreview, null, 2)}\n用户问题：${question}\n\n【Python代码正例】\nfields = ${JSON.stringify(userFields)}\n# 直接遍历data变量\ntotals = [sum([item[f] for f in fields]) for item in data]\n# ... 你的绘图代码 ...`;
+function buildUniversalPlotSystemPrompt(plotFields: string[], dataPreview: any[], userQuestion: string): string {
+  return `
+你是一个通用数据分析和可视化专家，面对实验、仓储、财务、科研、销售等各类表格。无论用户如何提问，你只能输出Python代码块（用\`\`\`python ... \`\`\`包裹），且代码最后必须有如下格式：
+result = {...}
+print(json.dumps(result, ensure_ascii=False))
+不能输出其他print语句或分析文本，否则会被判为错误。
+你只能直接使用变量 data（类型为 list[dict]，每个 dict 的 key 为字段名），禁止使用 pd.read_excel、open、os、path 等任何本地文件读取操作。
+【重要约束】：
+- 你只能对如下"相关字段"进行聚合、绘图等操作，不能用 row.values()、item.values() 等方式：
+  ${plotFields.join('、')}
+- 字段名必须严格按数据示例中的字段名书写，且为字符串类型。
+- 相关字段的名称可能为中文、英文、拼音、缩写或数字，请严格按给定字段名处理。
+- 禁止生成fig.show()、plt.show()、open_browser等任何弹窗或本地显示相关代码，只能生成plotly图表对象并输出其figure的JSON。
+- 你的代码最后必须有result = fig.to_dict()，并print(json.dumps(result, ensure_ascii=False))，不能有fig.show()。
+- 【禁止】在代码中出现 data = [...]、data = [{{...}}]、data = list(...)、data = json.loads(...) 等任何重新定义data变量的写法，必须直接使用后端传入的data变量，否则只会画出部分数据。
+- 你必须根据data的字段结构和用户需求，自动判断最适合的可视化类型（如柱状图、折线图、饼图、极坐标、三维图等），并自动选择合适的字段作为坐标轴或图表维度，禁止写死字段名或坐标轴名，必须动态获取字段名和类型。
+- 对于二维图表，自动选择合适的字段作为x/y轴；对于极坐标、三维图等，自动选择合适的字段作为r/theta/z等。
+- 代码必须自动识别data的所有字段名，动态生成绘图代码。
+数据示例（仅供参考）：
+${JSON.stringify(dataPreview, null, 2)}
+用户问题：${userQuestion}
+【Python代码正例】
+fields = list(data[0].keys())
+# 自动获取字段名
+# ... 你的绘图代码 ...
+`
 }
 
 /**
@@ -318,19 +350,28 @@ async function detectPlotDataStatus(question: string, plotFields: string[], plot
 }
 
 /**
- * 绘图数据计算agent：根据用户问题和结构化数据，生成并执行pandas数据处理代码，返回新数据
- * 仅在数据状态为'todo'或'both'时调用
+ * 绘图数据计算agent：根据用户问题和原始数据，生成pandas代码并真实执行，输出聚合/统计结果
  * @param {string} question 用户问题
- * @param {any[]} plotData 结构化数据（DataFrame）
+ * @param {any[]} data 原始数据
  * @param {string} model LLM模型名
- * @returns {Promise<any[]>} 处理后的新数据
+ * @returns {Promise<any[]>} 聚合/统计后的对象数组
  */
-async function calcPlotDataWithLLM(question: string, plotData: any[], model: string): Promise<any[]> {
-  // 取前5行样本，构造prompt
-  const dataPreview = plotData.slice(0, 5)
-  const fields = plotData[0] ? Object.keys(plotData[0]) : []
-  const prompt = `你是一个资深数据分析师。请根据用户问题和数据样本，生成pandas代码对数据做二次计算（如总分、均值、分组统计等），并输出新的DataFrame（只返回代码块，变量名为df，结果变量为result_df，必须print(result_df.to_json(orient='records', force_ascii=False))）。\n【重要约束】你只能用pandas做数据处理，禁止生成任何matplotlib、seaborn、plt等绘图库相关代码，禁止import这些库。字段名必须严格按样本数据中的字段名书写，禁止随意拼写、换行、添加空格，禁止用fields=...硬编码。\n用户问题：${question}\n字段：${JSON.stringify(fields)}\n数据样本：${JSON.stringify(dataPreview, null, 2)}\n【代码示例】\nimport pandas as pd\ndf = pd.DataFrame(data)\n# ... 你的处理 ...\nresult_df = ... # 处理后的DataFrame\nprint(result_df.to_json(orient='records', force_ascii=False))\n`
-  // 调用LLM生成代码
+async function calcPlotDataWithLLM(question: string, data: any[], model: string): Promise<any[]> {
+  const allFields = data[0] ? Object.keys(data[0]) : []
+  const dataPreview = data.slice(0, 5)
+  const prompt = `
+你是数据分析专家。请根据用户问题和原始数据，生成pandas代码对data（list[dict]）做聚合/统计，输出新的DataFrame，字段名需与业务语义一致且动态生成。只输出Python代码块，变量名为data，结果变量为result_df，最后print(result_df.to_json(orient='records', force_ascii=False))。
+用户问题：${question}
+所有字段：${JSON.stringify(allFields)}
+数据示例：${JSON.stringify(dataPreview, null, 2)}
+【代码示例】
+import pandas as pd
+df = pd.DataFrame(data)
+# ... 你的处理 ...
+result_df = ... # 处理后的DataFrame
+print(result_df.to_json(orient='records', force_ascii=False))
+`
+  // 调用LLM
   const res = await callLLMWithRetry({
     model,
     messages: [
@@ -349,10 +390,10 @@ async function calcPlotDataWithLLM(question: string, plotData: any[], model: str
   } catch {
     throw new Error('LLM未能生成有效的pandas代码')
   }
-  // 用Python执行代码，传入plotData
+  // 用Python真实执行代码，传入data
   const tmpData = path.join(process.cwd(), 'tmp_calc_data.json')
   const tmpCode = path.join(process.cwd(), 'tmp_calc_code.py')
-  fs.writeFileSync(tmpData, JSON.stringify(plotData, null, 2), { encoding: 'utf-8' })
+  fs.writeFileSync(tmpData, JSON.stringify(data, null, 2), { encoding: 'utf-8' })
   // 拼接完整python脚本，强制utf-8
   const pyCode = `import sys\nimport io\nsys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')\nsys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')\nimport json\nimport pandas as pd\nwith open(r'${tmpData}', 'r', encoding='utf-8') as f:\n    data = json.load(f)\n${code}\n`
   fs.writeFileSync(tmpCode, pyCode, { encoding: 'utf-8' })
@@ -367,6 +408,7 @@ async function calcPlotDataWithLLM(question: string, plotData: any[], model: str
       if (code === 0) {
         try {
           const result = JSON.parse(output)
+          console.log('[绘图数据计算agent] 真实运行pandas代码后数据：', JSON.stringify(result))
           resolve(result)
         } catch (e) {
           reject(e)
@@ -415,7 +457,7 @@ async function callCodeFixAgent(params: { userQuestion: string, plotData: any[],
 }
 
 /**
- * 智能代码生成agent：根据绘图需求，生成可执行的plotly Python代码
+ * 智能代码生成agent：根据绘图需求，生成可执行的plotly Python代码（字段名、坐标轴、图表类型均自动识别）
  * @param {string} systemPrompt - 绘图需求prompt
  * @param {string} userQuestion - 用户问题
  * @param {string} model - LLM模型名
@@ -545,6 +587,272 @@ async function autoFixWithCodeRepairAgent({
 }
 
 /**
+ * SSE事件发送工具函数
+ * @param {TransformStream} stream - 流
+ * @param {string} event - 事件名称
+ * @param {any} data - 事件数据
+ */
+function sendSSE(stream: TransformStream, event: string, data: any) {
+  const writer = stream.writable.getWriter();
+  const encoder = new TextEncoder();
+  writer.write(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+  writer.releaseLock();
+}
+
+/**
+ * 处理GET请求，用于建立SSE连接
+ * @returns {Response} - SSE流响应
+ */
+export async function GET(request: Request) {
+  // 获取会话ID
+  const url = new URL(request.url);
+  const sessionId = url.searchParams.get('sessionId');
+  
+  console.log(`[SSE连接] 接收到GET请求，会话ID: ${sessionId}`);
+
+  // 创建SSE流，用于向前端发送执行进度
+  const stream = new TransformStream();
+  const responseStream = new Response(stream.readable, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    },
+  });
+
+  // 如果有会话ID且存在对应的会话数据，则开始处理该会话
+  if (sessionId && sessionStore.has(sessionId)) {
+    const session = sessionStore.get(sessionId)!;
+    
+    // 发送初始化消息
+    sendSSE(stream, 'open', { message: `SSE连接已建立，会话ID: ${sessionId}` });
+    console.log(`[SSE连接] 已建立，会话ID: ${sessionId}`);
+    
+    // 如果会话状态为pending，则开始处理
+    if (session.status === 'pending') {
+      session.status = 'processing';
+      
+      // 异步处理，将结果发送到stream
+      (async () => {
+        try {
+          // 从会话中获取数据
+          const { question, data, model } = session;
+          
+          console.log(`[会话${sessionId}] 开始处理绘图请求，模型: ${model}`);
+          
+          // 向前端发送初始化状态
+          sendSSE(stream, 'start', { message: '开始处理绘图请求' });
+
+          // 1. 字段提取agent：提取与绘图相关的字段和结构化数据
+          sendSSE(stream, 'agent_status', { 
+            agent: '字段提取agent', 
+            status: 'running' 
+          });
+          const { plotFields, plotData } = await extractPlotFieldsAndData(question, data, model)
+          console.log(`[会话${sessionId}][字段提取agent] 执行状态: 成功`);
+          console.log(`[会话${sessionId}][字段提取agent] 提取的字段：`, JSON.stringify(plotFields));
+          sendSSE(stream, 'agent_status', { 
+            agent: '字段提取agent', 
+            status: 'success',
+            fields: plotFields
+          });
+          
+          if (!plotFields.length) {
+            sendSSE(stream, 'error', { error: '未能识别出可用字段' });
+            session.status = 'error';
+            return;
+          }
+
+          // 2. 数据处理逻辑agent：判断是否需要二次计算
+          sendSSE(stream, 'agent_status', { 
+            agent: '数据处理逻辑agent', 
+            status: 'running' 
+          });
+          const dataStatus = await detectPlotDataStatus(question, plotFields, plotData, model)
+          console.log(`[会话${sessionId}][数据处理逻辑agent] 执行状态:`, dataStatus);
+          sendSSE(stream, 'agent_status', { 
+            agent: '数据处理逻辑agent', 
+            status: 'success',
+            result: dataStatus
+          });
+          
+          let finalPlotData = plotData
+          // 3. 绘图数据计算agent：如需，生成并执行pandas代码
+          if (dataStatus === 'todo' || dataStatus === 'both') {
+            sendSSE(stream, 'agent_status', { 
+              agent: '绘图数据计算agent', 
+              status: 'running' 
+            });
+            let calcCode = ''
+            let calcError = ''
+            let calcResult = null
+            // 先尝试一次
+            try {
+              calcResult = await calcPlotDataWithLLM(question, plotData, model)
+              finalPlotData = calcResult
+              console.log(`[会话${sessionId}][绘图数据计算agent] 执行状态: 成功`);
+              sendSSE(stream, 'agent_status', { 
+                agent: '绘图数据计算agent', 
+                status: 'success',
+                result: '数据计算完成'
+              });
+            } catch (e) {
+              calcError = getErrorMsg(e)
+              // 自动进入多次修复agent
+              try {
+                sendSSE(stream, 'agent_status', { 
+                  agent: '代码修复agent', 
+                  status: 'running' 
+                });
+                finalPlotData = await autoFixWithCodeRepairAgent({
+                  userQuestion: question,
+                  plotData: plotData,
+                  lastCode: '', // 如能获取到上次代码可补充
+                  errorMsg: calcError,
+                  model,
+                  maxRetry: 3,
+                  runCodeFn: runCodeWithAutoFieldCheck
+                })
+                console.log(`[会话${sessionId}][代码修复agent] 执行状态: 成功`);
+                sendSSE(stream, 'agent_status', { 
+                  agent: '代码修复agent', 
+                  status: 'success' 
+                });
+              } catch (fixErr) {
+                console.error(`[会话${sessionId}][代码修复agent] 执行状态: 失败`);
+                sendSSE(stream, 'agent_status', { 
+                  agent: '代码修复agent', 
+                  status: 'error',
+                  error: String(fixErr)
+                });
+                sendSSE(stream, 'error', { 
+                  error: '[绘图数据计算agent] 数据二次计算及修复均失败', 
+                  detail: String(fixErr) 
+                });
+                session.status = 'error';
+                return;
+              }
+            }
+          }
+
+          // 4. 智能绘图agent：用LLM生成plotly代码（只生成一次，不重试）
+          sendSSE(stream, 'agent_status', { 
+            agent: '智能绘图agent', 
+            status: 'running' 
+          });
+          const dataPreview = finalPlotData.slice(0, 5)
+          const systemPrompt = buildUniversalPlotSystemPrompt(plotFields, dataPreview, question)
+          console.log(`[会话${sessionId}][智能绘图agent] 执行状态: 已生成绘图需求`);
+          console.log(`[会话${sessionId}][智能绘图agent] systemPrompt内容：\n` + systemPrompt);
+          sendSSE(stream, 'agent_status', { 
+            agent: '智能绘图agent', 
+            status: 'success' 
+          });
+          
+          // 智能代码生成agent：封装调用
+          sendSSE(stream, 'agent_status', { 
+            agent: '智能代码生成agent', 
+            status: 'running' 
+          });
+          let llmCode = await callCodeGenAgent(systemPrompt, question, model)
+          if (!llmCode || hasNoResultDefinition(llmCode)) {
+            console.log(`[会话${sessionId}][智能代码生成agent] 执行状态: 失败（缺少result定义）`);
+            sendSSE(stream, 'agent_status', { 
+              agent: '智能代码生成agent', 
+              status: 'error',
+              error: 'LLM未能生成有效的plotly代码（缺少result定义）'
+            });
+            sendSSE(stream, 'error', { error: 'LLM未能生成有效的plotly代码（缺少result定义）' });
+            session.status = 'error';
+            return;
+          }
+          sendSSE(stream, 'agent_status', { 
+            agent: '智能代码生成agent', 
+            status: 'success' 
+          });
+
+          // 5. 执行plotly代码，失败则进入代码修复agent，最多修复3次
+          let plotly_figure = null
+          try {
+            sendSSE(stream, 'agent_status', { 
+              agent: '智能绘图执行', 
+              status: 'running' 
+            });
+            plotly_figure = await autoFixWithCodeRepairAgent({
+              userQuestion: question,
+              plotData: finalPlotData,
+              lastCode: llmCode,
+              errorMsg: '',
+              model,
+              maxRetry: 3,
+              runCodeFn: runCodeWithAutoFieldCheck
+            })
+            console.log(`[会话${sessionId}][智能绘图主流程] 执行状态: 成功`);
+            sendSSE(stream, 'agent_status', { 
+              agent: '智能绘图执行', 
+              status: 'success' 
+            });
+          } catch (e) {
+            console.error(`[会话${sessionId}][智能绘图主流程] 执行状态: 失败（代码修复多次失败）`);
+            sendSSE(stream, 'agent_status', { 
+              agent: '智能绘图执行', 
+              status: 'error',
+              error: getErrorMsg(e)
+            });
+            sendSSE(stream, 'error', { 
+              error: 'LLM代码生成及修复均失败', 
+              detail: getErrorMsg(e) 
+            });
+            session.status = 'error';
+            return;
+          }
+
+          // 6. 返回结构
+          sendSSE(stream, 'result', {
+            answer: '已为你生成图表，支持下载PNG/SVG/HTML。',
+            plotly_figure
+          });
+          
+          session.status = 'completed';
+        } catch (error) {
+          console.error(`[会话${sessionId}][智能绘图主流程] 执行状态: 失败`, error);
+          sendSSE(stream, 'error', { error: '处理绘图请求时发生错误' });
+          session.status = 'error';
+        } finally {
+          // 关闭流
+          const writer = stream.writable.getWriter();
+          writer.close();
+          
+          // 5分钟后清理会话数据
+          setTimeout(() => {
+            if (sessionStore.has(sessionId)) {
+              sessionStore.delete(sessionId);
+              console.log(`[会话${sessionId}] 已清理`);
+            }
+          }, 5 * 60 * 1000);
+        }
+      })();
+    } else {
+      // 会话已经在处理中，发送状态消息
+      sendSSE(stream, 'open', { message: `会话已在处理中，状态: ${session.status}` });
+    }
+  } else {
+    // 没有会话ID或会话不存在
+    sendSSE(stream, 'open', { message: '等待POST请求启动绘图流程' });
+    
+    // 如果没有会话ID，30秒后自动关闭
+    if (!sessionId) {
+      setTimeout(() => {
+        const writer = stream.writable.getWriter();
+        writer.close();
+      }, 30000);
+    }
+  }
+
+  return responseStream;
+}
+
+/**
  * 智能绘图API（新版链路）
  * @param {Request} request - POST请求，包含question, data, columns
  * @returns {Promise<Response>} - plotly_figure及answer
@@ -552,107 +860,38 @@ async function autoFixWithCodeRepairAgent({
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    // 修改获取模型的逻辑，优先使用前端传递的模型，其次是全局变量，最后是环境变量
-    const frontendModel = body.model; // 前端传递的模型
-    const globalModel = (globalThis as any).currentLLMModel; // 全局模型变量
-    const defaultModel = process.env.MODEL_NAME || 'THUDM/GLM-4-9B-0414';
+    const sessionId = body.sessionId || Date.now().toString();
+    const model = body.model || (globalThis as any).currentLLMModel || process.env.MODEL_NAME || 'THUDM/GLM-4-9B-0414';
+    const question = body.question;
+    const data = body.data || [];
     
-    // 优先级：前端传递 > 全局变量 > 环境变量默认值
-    const model = frontendModel || globalModel || defaultModel;
+    console.log(`[绘图API] 接收到POST请求，会话ID: ${sessionId}, 模型: ${model}`);
     
-    // 将选择的模型设置为全局变量，确保后续请求使用相同模型
+    // 参数验证
+    if (!question || !Array.isArray(data) || data.length === 0) {
+      return NextResponse.json({ error: '缺少问题或数据' }, { status: 400 });
+    }
+    
+    // 更新全局模型，确保后续请求使用相同模型
     (globalThis as any).currentLLMModel = model;
     
-    // 新增模型切换日志
-    console.log(`[模型切换] 当前模型已切换为: ${model}，来源: ${frontendModel ? '前端传递' : (globalModel ? '全局变量' : '环境变量默认值')}`);
+    // 将请求数据存入会话存储
+    sessionStore.set(sessionId, {
+      question,
+      data,
+      model,
+      status: 'pending'
+    });
     
-    const question = body.question
-    const data = body.data || []
-    if (!question || !Array.isArray(data) || data.length === 0) {
-      return NextResponse.json({ error: '缺少问题或数据' }, { status: 400 })
-    }
-
-    // 1. 字段提取agent：提取与绘图相关的字段和结构化数据
-    const { plotFields, plotData } = await extractPlotFieldsAndData(question, data, model)
-    console.log('[字段提取agent] 执行状态: 成功')
-    console.log('[字段提取agent] 提取的字段：', JSON.stringify(plotFields))
-    if (!plotFields.length) {
-      return NextResponse.json({ error: '未能识别出可用字段' }, { status: 400 })
-    }
-
-    // 2. 数据处理逻辑agent：判断是否需要二次计算
-    const dataStatus = await detectPlotDataStatus(question, plotFields, plotData, model)
-    console.log('[数据处理逻辑agent] 执行状态:', dataStatus)
-    let finalPlotData = plotData
-    // 3. 绘图数据计算agent：如需，生成并执行pandas代码
-    if (dataStatus === 'todo' || dataStatus === 'both') {
-      let calcCode = ''
-      let calcError = ''
-      let calcResult = null
-      // 先尝试一次
-      try {
-        calcResult = await calcPlotDataWithLLM(question, plotData, model)
-        finalPlotData = calcResult
-        console.log('[绘图数据计算agent] 执行状态: 成功')
-      } catch (e) {
-        calcError = getErrorMsg(e)
-        // 自动进入多次修复agent
-        try {
-          finalPlotData = await autoFixWithCodeRepairAgent({
-            userQuestion: question,
-            plotData: plotData,
-            lastCode: '', // 如能获取到上次代码可补充
-            errorMsg: calcError,
-            model,
-            maxRetry: 3,
-            runCodeFn: runCodeWithAutoFieldCheck
-          })
-          console.log('[代码修复agent] 执行状态: 成功')
-        } catch (fixErr) {
-          console.error('[代码修复agent] 执行状态: 失败')
-          return NextResponse.json({ error: '[绘图数据计算agent] 数据二次计算及修复均失败', detail: String(fixErr) }, { status: 500 })
-        }
-      }
-    }
-
-    // 4. 智能绘图agent：用LLM生成plotly代码（只生成一次，不重试）
-    const dataPreview = finalPlotData.slice(0, 5)
-    const systemPrompt = buildUniversalPlotSystemPrompt(plotFields, dataPreview, question)
-    console.log('[智能绘图agent] 执行状态: 已生成绘图需求')
-    console.log('[智能绘图agent] systemPrompt内容：\n' + systemPrompt)
+    console.log(`[绘图API] 已创建会话 ${sessionId}，等待SSE连接`);
     
-    // 智能代码生成agent：封装调用
-    let llmCode = await callCodeGenAgent(systemPrompt, question, model)
-    if (!llmCode || hasNoResultDefinition(llmCode)) {
-      console.log('[智能代码生成agent] 执行状态: 失败（缺少result定义）')
-      return NextResponse.json({ error: 'LLM未能生成有效的plotly代码（缺少result定义）' }, { status: 500 })
-    }
-
-    // 5. 执行plotly代码，失败则进入代码修复agent，最多修复3次
-    let plotly_figure = null
-    try {
-      plotly_figure = await autoFixWithCodeRepairAgent({
-        userQuestion: question,
-        plotData: finalPlotData,
-        lastCode: llmCode,
-        errorMsg: '',
-        model,
-        maxRetry: 3,
-        runCodeFn: runCodeWithAutoFieldCheck
-      })
-      console.log('[智能绘图主流程] 执行状态: 成功')
-    } catch (e) {
-      console.error('[智能绘图主流程] 执行状态: 失败（代码修复多次失败）')
-      return NextResponse.json({ error: 'LLM代码生成及修复均失败', detail: getErrorMsg(e) }, { status: 500 })
-    }
-
-    // 6. 返回结构
-    return NextResponse.json({
-      answer: '已为你生成图表，支持下载PNG/SVG/HTML。',
-      plotly_figure
-    })
+    return NextResponse.json({ 
+      success: true, 
+      message: '请求已接收，请通过SSE连接获取执行进度和结果',
+      sessionId
+    });
   } catch (error) {
-    console.error('[智能绘图主流程] 执行状态: 失败', error)
-    return NextResponse.json({ error: '处理绘图请求时发生错误' }, { status: 500 })
+    console.error('[绘图API] 处理POST请求失败', error);
+    return NextResponse.json({ error: '处理请求时发生错误' }, { status: 500 });
   }
 } 

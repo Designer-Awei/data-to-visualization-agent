@@ -6,7 +6,7 @@
 
 import React, { useState, useRef, useEffect } from 'react'
 import { Input, Button, Card, Spin, Alert, Typography, Select, Upload, Avatar, Modal } from 'antd'
-import { SendOutlined, InboxOutlined, UserOutlined, RobotOutlined, SettingOutlined } from '@ant-design/icons'
+import { SendOutlined, InboxOutlined, UserOutlined, RobotOutlined, SettingOutlined, LoadingOutlined, CheckCircleOutlined } from '@ant-design/icons'
 import { QAState, QAResponse, DataState, Message } from '@/types/qa'
 import type { UploadProps } from 'antd'
 import { message } from 'antd'
@@ -67,6 +67,15 @@ function splitMarkdownSegments(content: string): Array<{type: 'text', content: s
 }
 
 type QAStateFixed = QAState & { plotlyFigure?: any }
+
+// 定义agent状态类型
+type AgentStatus = {
+  agent: string;
+  status: 'idle' | 'running' | 'success' | 'error';
+  error?: string;
+  fields?: string[];
+  result?: any;
+};
 
 // 开场白初始化
 const initialMessages = [
@@ -164,6 +173,10 @@ export const QA: React.FC = () => {
     }
   }, [hasEnvApiKey])
 
+  // 添加agent执行状态跟踪
+  const [agentStatus, setAgentStatus] = useState<AgentStatus[]>([]);
+  const [eventSource, setEventSource] = useState<EventSource | null>(null);
+
   /**
    * 处理问题输入变化
    */
@@ -210,7 +223,7 @@ export const QA: React.FC = () => {
           isLoading: false,
           data: responseData,
           error: null,
-          messages: [] // 上传新文件后自动清空历史消息
+          messages: initialMessages as Message[]
         }))
         message.success(`${info.file.name} 文件解析成功`)
       } else if (status === 'error') {
@@ -243,6 +256,9 @@ export const QA: React.FC = () => {
     if (!state.question.trim() || state.isLoading) return
     setInputDisabled(true)
     setIsAborting(false)
+    // 清空上一次的agent状态
+    setAgentStatus([]);
+    
     setState(prev => ({
       ...prev,
       isLoading: true,
@@ -251,8 +267,12 @@ export const QA: React.FC = () => {
       messages: [...prev.messages, { role: 'user', content: prev.question }],
       plotlyFigure: null // 每次提交时重置
     }))
-    const controller = new AbortController()
-    setAbortController(controller)
+    
+    // 关闭之前的EventSource连接
+    if (eventSource) {
+      eventSource.close();
+    }
+    
     // 构造仅最近一轮有效问答的 messages 作为 API 参数
     let lastAssistantMsg: Message | null = null
     for (let i = state.messages.length - 1; i >= 0; i--) {
@@ -267,7 +287,220 @@ export const QA: React.FC = () => {
       : [{ role: 'user', content: state.question }]
     // 防御性过滤
     const safeApiMessages: Message[] = apiMessages.filter(m => m.content && typeof m.content === 'string' && m.content.trim())
+    
+    // 检测意图，如果是绘图意图，使用SSE连接
     try {
+      // 先调用意图检测API，确认是否是绘图相关问题
+      const intentResponse = await fetch('/api/qa/intent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question: state.question,
+          model: state.model
+        })
+      });
+      
+      const intentData = await intentResponse.json();
+      
+      // 如果是绘图意图，使用EventSource监听进度
+      if (intentData.intent === 'plot') {
+        // 添加一个临时消息，用于展示agent执行进度
+        setState(prev => ({
+          ...prev,
+          messages: [
+            ...prev.messages,
+            {
+              role: 'assistant',
+              content: '正在为您生成图表，请稍候...',
+              isTemp: true // 标记为临时消息
+            } as any
+          ]
+        }));
+        
+        // 关闭旧的EventSource
+        if (eventSource) {
+          eventSource.close();
+          setEventSource(null);
+        }
+        
+        console.log('[DEBUG] 准备发送绘图请求并建立SSE连接');
+        
+        // 先POST，收到后端sessionId后再建立SSE连接
+        fetch('/api/visualization/create', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            question: state.question,
+            model: state.model,
+            data: state.data?.rows || []
+          })
+        })
+          .then(res => res.json())
+          .then(data => {
+            if (!data.sessionId) {
+              throw new Error('后端未返回sessionId');
+            }
+            const sessionId = data.sessionId;
+            // 创建EventSource监听SSE事件，带上会话ID
+            console.log('[DEBUG] 准备建立SSE连接:', `/api/visualization/create?sessionId=${sessionId}`);
+            const source = new EventSource(`/api/visualization/create?sessionId=${sessionId}`);
+            setEventSource(source);
+            
+            // 监听连接打开事件
+            source.addEventListener('open', (event) => {
+              console.log('[DEBUG] SSE连接已打开', event);
+            });
+            
+            // 监听agent状态更新
+            source.addEventListener('agent_status', (event) => {
+              console.log('[DEBUG] 收到agent_status事件:', event.data);
+              try {
+                const data = JSON.parse(event.data);
+                console.log('[DEBUG] 已解析agent状态:', data);
+                
+                setAgentStatus(prev => {
+                  // 查找是否已存在该agent
+                  const existingIndex = prev.findIndex(item => item.agent === data.agent);
+                  if (existingIndex >= 0) {
+                    // 更新现有agent状态
+                    const updated = [...prev];
+                    updated[existingIndex] = data;
+                    return updated;
+                  } else {
+                    // 添加新agent状态
+                    return [...prev, data];
+                  }
+                });
+              } catch (e) {
+                console.error('[DEBUG] 解析agent_status事件数据失败:', e, event.data);
+              }
+            });
+            
+            // 监听start事件
+            source.addEventListener('start', (event) => {
+              console.log('[DEBUG] 收到start事件:', event.data);
+            });
+            
+            // 监听结果
+            source.addEventListener('result', (event) => {
+              console.log('[DEBUG] 收到result事件:', event.data);
+              try {
+                const data = JSON.parse(event.data);
+                // 移除临时消息并添加最终结果
+                setState(prev => {
+                  const filteredMessages = prev.messages.filter(msg => !(msg as any).isTemp);
+                  return {
+                    ...prev,
+                    isLoading: false,
+                    answer: data,
+                    messages: [
+                      ...filteredMessages,
+                      {
+                        role: 'assistant',
+                        content: data.answer
+                      }
+                    ],
+                    plotlyFigure: data.plotly_figure
+                  };
+                });
+                
+                source.close();
+                setEventSource(null);
+                setInputDisabled(false);
+                // 清空agent状态
+                setAgentStatus([]);
+              } catch (e) {
+                console.error('[DEBUG] 解析result事件数据失败:', e, event.data);
+              }
+            });
+            
+            // 监听错误
+            source.addEventListener('error', (event) => {
+              console.log('[DEBUG] 收到error事件或连接错误:', event);
+              try {
+                // 注意：error事件可能没有event.data
+                let errorData = { error: '未知错误' };
+                if (event.data) {
+                  errorData = JSON.parse(event.data);
+                  console.log('[DEBUG] 已解析error数据:', errorData);
+                }
+                
+                // 移除临时消息并添加错误信息
+                setState(prev => {
+                  const filteredMessages = prev.messages.filter(msg => !(msg as any).isTemp);
+                  return {
+                    ...prev,
+                    isLoading: false,
+                    error: errorData.error,
+                    messages: [
+                      ...filteredMessages,
+                      {
+                        role: 'assistant',
+                        content: `【LLM服务异常】${errorData.error || '未知错误'}${errorData.detail ? '\n' + errorData.detail : ''}`,
+                        error: errorData.error,
+                        detail: errorData.detail,
+                        confidence: undefined
+                      } as Message
+                    ]
+                  };
+                });
+              } catch (e) {
+                console.error('[DEBUG] 处理error事件失败:', e);
+                setState(prev => ({
+                  ...prev,
+                  isLoading: false,
+                  error: '连接异常，请重试',
+                  messages: [
+                    ...prev.messages.filter(msg => !(msg as any).isTemp),
+                    {
+                      role: 'assistant',
+                      content: '【连接异常】服务器连接中断，请重试',
+                      confidence: undefined
+                    } as Message
+                  ]
+                }));
+              }
+              
+              source.close();
+              setEventSource(null);
+              setInputDisabled(false);
+              // 清空agent状态
+              setAgentStatus([]);
+            });
+            
+            // 设置SSE连接超时处理
+            setTimeout(() => {
+              if (source.readyState !== 2) { // 2表示CLOSED
+                console.log('[DEBUG] SSE连接超时检查 - 当前状态:', source.readyState);
+              }
+            }, 5000);
+          })
+          .catch(err => {
+            console.error('[DEBUG] POST请求或SSE连接失败:', err);
+            setState(prev => ({
+              ...prev,
+              isLoading: false,
+              error: '请求或连接失败',
+              messages: [
+                ...prev.messages.filter(msg => !(msg as any).isTemp),
+                {
+                  role: 'assistant',
+                  content: '【连接异常】请求或SSE连接失败',
+                  confidence: undefined
+                } as Message
+              ]
+            }));
+            setInputDisabled(false);
+          });
+        return;
+      }
+      
+      // 如果不是绘图意图，使用普通fetch流程
+      const controller = new AbortController()
+      setAbortController(controller)
+      
       const response = await fetch('/api/qa', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -370,6 +603,39 @@ export const QA: React.FC = () => {
       plotlyFigure: null
     }))
   }
+
+  /**
+   * 渲染agent执行状态列表
+   */
+  const renderAgentStatus = () => {
+    if (agentStatus.length === 0) return null;
+    
+    return (
+      <div className="mb-4 p-3 border border-gray-200 rounded">
+        <div className="text-sm font-medium mb-2">执行进度：</div>
+        <div className="space-y-2">
+          {agentStatus.map((agent, index) => (
+            <div key={index} className="flex items-center text-sm">
+              {agent.status === 'running' ? (
+                <LoadingOutlined className="mr-2 text-blue-500" spin />
+              ) : agent.status === 'success' ? (
+                <CheckCircleOutlined className="mr-2 text-green-500" />
+              ) : agent.status === 'error' ? (
+                <span className="mr-2 text-red-500">✕</span>
+              ) : (
+                <span className="mr-2">○</span>
+              )}
+              <span>
+                {agent.agent}: {agent.status === 'running' ? '执行中' : 
+                             agent.status === 'success' ? '执行完成' : 
+                             agent.status === 'error' ? '执行失败' : '等待中'}
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="space-y-6">
@@ -512,6 +778,22 @@ export const QA: React.FC = () => {
                     safeContent = '【LLM服务异常】未知错误'
                   }
                 }
+                
+                // 对于临时消息，显示agent状态
+                if ((msg as any).isTemp) {
+                  return (
+                    <div key={index} className={`flex items-start space-x-3 mb-4`}>
+                      <Avatar icon={<RobotOutlined />} className="bg-green-500" />
+                      <div className="max-w-[70%] bg-white p-3 rounded-lg shadow">
+                        <div className="markdown-body mb-2">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{typeof safeContent === 'string' ? safeContent : ''}</ReactMarkdown>
+                        </div>
+                        {renderAgentStatus()}
+                      </div>
+                    </div>
+                  );
+                }
+                
                 // 新增：只返回 analysis 时直接渲染 analysis
                 if (typeof safeContent === 'object' && (safeContent as any).analysis) {
                   return (
