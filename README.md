@@ -54,6 +54,21 @@
 - npm 或 yarn
 - Python（仅用于 plotly 代码执行，无需 FastAPI）
 
+### 运行环境要求（推荐）
+- Node.js 18 及以上（建议LTS版本）
+- Python 3.8 ~ 3.11（推荐3.10或3.11，兼容性最佳）
+- pip 依赖包：pandas、plotly、numpy、openpyxl
+
+#### Python依赖安装示例
+```bash
+pip install pandas plotly numpy openpyxl
+```
+
+> 说明：
+> - 项目运行在任何电脑上都必须有 Node.js 和 Python 环境。
+> - Python 仅用于后端本地执行LLM生成的分析/绘图代码。
+> - 推荐使用Anaconda/Miniconda等虚拟环境管理工具。
+
 ---
 
 ## 快速开始
