@@ -186,7 +186,7 @@ ${errorMsg}`
       { role: 'user', content: prompt }
     ],
     temperature: 0.2,
-    max_tokens: 512
+    max_tokens: 2048
   })
   return res.choices[0]?.message?.content || ''
 }
@@ -282,7 +282,7 @@ async function extractPlotFieldsLLM(question: string, data: any[], model: string
       { role: 'user', content: prompt }
     ],
     temperature: 0.2,
-    max_tokens: 128
+    max_tokens: 2048
   })
   let fields: string[] = []
   try {
@@ -333,7 +333,7 @@ async function detectPlotDataStatus(question: string, plotFields: string[], plot
       { role: 'user', content: prompt }
     ],
     temperature: 0.2,
-    max_tokens: 32
+    max_tokens: 2048
   })
   let status: 'origin'|'todo'|'both' = 'origin'
   try {
@@ -379,7 +379,7 @@ print(result_df.to_json(orient='records', force_ascii=False))
       { role: 'user', content: prompt }
     ],
     temperature: 0.2,
-    max_tokens: 512
+    max_tokens: 2048
   })
   let code = ''
   try {
@@ -445,7 +445,7 @@ async function callCodeFixAgent(params: { userQuestion: string, plotData: any[],
       { role: 'user', content: prompt }
     ],
     temperature: 0.2,
-    max_tokens: 1024
+    max_tokens: 2048
   })
   // 只提取代码块
   const content = res.choices[0]?.message?.content || ''
@@ -471,7 +471,7 @@ async function callCodeGenAgent(systemPrompt: string, userQuestion: string, mode
       { role: 'user', content: userQuestion }
     ],
     temperature: 0.2,
-    max_tokens: 1024
+    max_tokens: 2048
   })
   const content = res.choices[0]?.message?.content || ''
   let llmCode = content.match(/```python([\s\S]*?)```/)
@@ -865,12 +865,12 @@ export async function POST(request: Request) {
     const question = body.question;
     const data = body.data || [];
     
-    console.log(`[绘图API] 接收到POST请求，会话ID: ${sessionId}, 模型: ${model}`);
-    
-    // 参数验证
-    if (!question || !Array.isArray(data) || data.length === 0) {
-      return NextResponse.json({ error: '缺少问题或数据' }, { status: 400 });
+    // 1. 数据为空校验
+    if (!Array.isArray(data) || data.length === 0) {
+      return NextResponse.json({ error: '后端收到的数据为空，请检查上传/传参流程！' }, { status: 400 });
     }
+    
+    console.log(`[绘图API] 接收到POST请求，会话ID: ${sessionId}, 模型: ${model}`);
     
     // 更新全局模型，确保后续请求使用相同模型
     (globalThis as any).currentLLMModel = model;
@@ -892,6 +892,6 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     console.error('[绘图API] 处理POST请求失败', error);
-    return NextResponse.json({ error: '处理请求时发生错误' }, { status: 500 });
+    return NextResponse.json({ error: '处理请求时发生错误', detail: String(error) }, { status: 500 });
   }
 } 
